@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Test release source
+        run: go test ./...
+      - name: Build and publish release
+        uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
+        with:
+          distribution: goreleaser
+          version: v2.17.0
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify packaged archive
+        run: |
+          verify_dir="$(mktemp -d)"
+          archive="$(find dist -maxdepth 1 -name 'relaybox_*_linux_amd64.tar.gz' -print -quit)"
+          test -n "$archive"
+          tar -xzf "$archive" -C "$verify_dir"
+          version_output="$("$verify_dir/relaybox" version)"
+          test -n "$version_output"
+          test "$version_output" != "dev"
+          test -f "$verify_dir/LICENSE"
+          test -f "$verify_dir/README.md"
+      - name: Attest archives and checksums
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt

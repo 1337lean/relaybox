@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Relaybox</title>
+    <link rel="stylesheet" href="/app.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <h1>Relaybox</h1>
+      <p>Inspect and replay captured webhooks.</p>
+      <div class="actions login">
+        <input
+          id="token"
+          type="password"
+          autocomplete="current-password"
+          placeholder="Operator token"
+          aria-label="Operator token"
+        >
+        <button id="login" type="button">Unlock</button>
+      </div>
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </header>
+    <main>
+      <aside>
+        <label for="search">Search requests</label>
+        <input id="search" type="search" maxlength="256" placeholder="ID, path, delivery ID, or body">
+        <div id="list" class="list" aria-live="polite"></div>
+      </aside>
+      <section>
+        <h2>Request detail</h2>
+        <div class="actions">
+          <button id="copy" type="button" disabled>Copy body as safe curl</button>
+          <button id="replay" type="button" disabled>Replay to configured target</button>
+        </div>
+        <pre id="detail" class="empty">Enter the operator token, then send a webhook to POST /inbox.</pre>
+      </section>
+    </main>
+  </body>
+</html>

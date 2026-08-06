@@ -1,0 +1,22 @@
+services:
+  relaybox:
+    build: .
+    command: ["serve", "-addr", "0.0.0.0:8080", "-data", "/data/relaybox.ndjson"]
+    environment:
+      RELAYBOX_OPERATOR_TOKEN: "${RELAYBOX_OPERATOR_TOKEN:?set RELAYBOX_OPERATOR_TOKEN}"
+      RELAYBOX_SECRET: "${RELAYBOX_SECRET:-}"
+    ports: ["127.0.0.1:8080:8080"]
+    volumes: ["relaybox-data:/data"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    restart: unless-stopped
+    stop_grace_period: 25s
+    healthcheck:
+      test: ["CMD", "/relaybox", "healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+volumes:
+  relaybox-data:

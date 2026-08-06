@@ -1,0 +1,151 @@
+:root {
+  color-scheme: dark;
+  --background: #08111f;
+  --surface: #111e31;
+  --surface-raised: #17273e;
+  --border: #30445f;
+  --text: #edf5ff;
+  --muted: #9eb0c9;
+  --accent: #68e0bd;
+  --danger: #ff9b9b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  background: radial-gradient(circle at top left, #122742 0, var(--background) 38rem);
+  color: var(--text);
+  font: 15px/1.5 ui-sans-serif, system-ui, sans-serif;
+}
+
+header {
+  padding: 2.25rem max(1rem, 5vw) 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 0.25rem;
+  color: var(--accent);
+  letter-spacing: -0.03em;
+}
+
+main {
+  display: grid;
+  grid-template-columns: minmax(260px, 35%) minmax(0, 1fr);
+  gap: 1rem;
+  padding: 1rem max(1rem, 5vw) 3rem;
+}
+
+aside,
+section {
+  min-height: 15rem;
+  padding: 1rem;
+  border: 1px solid color-mix(in srgb, var(--border), transparent 25%);
+  border-radius: 0.9rem;
+  background: color-mix(in srgb, var(--surface), transparent 4%);
+  box-shadow: 0 1rem 3rem rgb(0 0 0 / 16%);
+}
+
+label {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+input,
+button {
+  min-height: 2.7rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  background: var(--surface-raised);
+  color: inherit;
+  font: inherit;
+}
+
+input {
+  width: 100%;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.login {
+  max-width: 35rem;
+}
+
+.login input {
+  flex: 1 1 16rem;
+}
+
+.status {
+  min-height: 1.5em;
+  margin-bottom: 0;
+  color: var(--muted);
+}
+
+.status.error {
+  color: var(--danger);
+}
+
+.list {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.item {
+  width: 100%;
+  text-align: left;
+}
+
+pre {
+  max-height: 65vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.empty {
+  color: var(--muted);
+}
+
+@media (max-width: 700px) {
+  main {
+    grid-template-columns: 1fr;
+  }
+}

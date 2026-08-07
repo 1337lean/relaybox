@@ -1,5 +1,11 @@
 .git
 .github
+.DS_Store
+.env
+.env.*
+!.env.example
 **/*_test.go
+*.test
 data
+dist
 relaybox

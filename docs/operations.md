@@ -11,7 +11,9 @@ Prefer environment variables to command-line secret flags:
 - `RELAYBOX_SENSITIVE_HEADERS` is a comma-separated extension to the default case-insensitive redaction policy.
 - `RELAYBOX_FORWARD_AUTHORIZATION` injects a destination-only `Authorization` header during forwarding. It is not persisted with captures.
 
-The default redaction names are `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `API-Key`, `X-API-Key`, `API-Token`, `X-API-Token`, `X-Auth-Token`, `X-Access-Token`, `X-Client-Token`, `X-Token`, `Secret-Key`, `X-Secret-Key`, `X-Secret`, `X-Client-Secret`, `X-Amz-Security-Token`, `X-Hub-Signature`, and `X-Hub-Signature-256`. Values are replaced with `[REDACTED]` before persistence and removed before forwarding.
+On startup, Relaybox scans the complete active append log for legacy request and response headers that match the current policy, replaces retained values, and compacts away historical values. Detail, SSE, replay, and forwarding paths also apply the policy when reading, so an interrupted migration fails closed at egress. Offline backups and copies made before a successful upgraded startup can still contain plaintext values. Treat those files as sensitive and rotate any credential that may have been recorded before upgrading.
+
+The exact default names include `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `API-Key`, `X-API-Key`, `API-Token`, `X-API-Token`, `X-Auth-Token`, `X-Access-Token`, `X-Client-Token`, `X-Token`, `Secret-Key`, `X-Secret-Key`, `X-Secret`, `X-Client-Secret`, `X-Amz-Security-Token`, `X-Hub-Signature`, and `X-Hub-Signature-256`. Relaybox also normalizes case and punctuation to identify API-key, authentication, credential, cookie, signature, secret, and token names such as `X-ApiKey`, `Authentication`, and `X-Credential-ID`. Values are replaced with `[REDACTED]` before persistence and removed before forwarding.
 
 When TLS terminates at a reverse proxy and the backend connection is plain HTTP, pass `-secure-cookie` so the browser session cookie retains its `Secure` attribute. Do not trust client-supplied forwarding headers to infer TLS state.
 
@@ -22,7 +24,7 @@ The most important bounds are:
 - `-max-body` and `-max-inflight` bound request memory and concurrent reads.
 - `-retention-captures` bounds retained captures (default 1,000).
 - `-jobs-per-request` bounds retained original/replay jobs for one capture (default 8).
-- `-retention-events` selects the log compaction threshold (default 100,000 events).
+- `-retention-events` selects the mutation count that triggers log compaction (default 100,000 events).
 - `-search-bytes` bounds the body prefix indexed per capture (default 64 KiB).
 - `-attempts`, `-concurrency`, and `-queue-size` bound delivery attempts, workers, and wake-up hints.
 
@@ -30,7 +32,7 @@ Search query length is limited to 256 bytes, page size to 200, and work to the r
 
 When capture retention is full, Relaybox evicts the oldest capture whose jobs are all terminal. It never evicts pending, leased, or retrying work. If nothing is eligible, inbox requests receive `507 Insufficient Storage`; reduce unfinished work or raise retention deliberately. Replay similarly returns 507 when every retained job slot is active.
 
-Compaction preserves the current request, attempt, and job state in a synced replacement file. Stop Relaybox before copying or replacing the data file. Test recovery against a copy. A partial final event is removed on startup; earlier corruption, sequence gaps, invalid state, or digest mismatches require restoration from backup.
+Compaction preserves the current request, attempt, and job state in a synced replacement file and advances the global sequence across the snapshot. The in-memory store keeps metadata, record offsets, and bounded search prefixes; full request and response bodies remain disk-backed and are read on demand. Stop Relaybox before copying or replacing the data file. Test recovery against a copy. A partial final event is removed on startup; earlier corruption, sequence gaps, invalid state, or digest mismatches require restoration from backup.
 
 ## Health, metrics, and shutdown
 

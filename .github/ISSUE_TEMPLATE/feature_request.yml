@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a focused Relaybox improvement
+title: "feature: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What operator or delivery problem should Relaybox solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the interface and expected behavior, including compatibility implications.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and durability impact
+      description: Note effects on the trust boundary, append-log compatibility, retention, forwarding, or release artifacts.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

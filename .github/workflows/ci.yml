@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.25.x'
@@ -20,7 +22,9 @@ jobs:
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
       - name: Lint Markdown
-        run: npx --yes markdownlint-cli2@0.20.0 README.md CONTRIBUTING.md SECURITY.md 'docs/*.md'
+        run: npx --yes markdownlint-cli2@0.20.0 README.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md 'docs/*.md' '.github/**/*.md'
+      - name: Lint workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: Vet
         run: go vet ./...
       - name: Staticcheck
@@ -43,6 +47,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.25.x'
@@ -54,6 +60,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.25.x'
@@ -87,3 +95,43 @@ jobs:
           name: relaybox-image-sbom
           path: relaybox-image.cdx.json
           if-no-files-found: error
+
+  release-validation:
+    name: release-validation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: Validate release configuration
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.17.1
+          args: check
+      - name: Build release candidate without publishing
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.17.1
+          args: release --snapshot --clean --skip=publish
+      - name: Verify exact matrix, contents, checksums, binaries, and host version
+        run: go run ./cmd/releasecheck -dist dist
+      - name: Prove corruption blocks release validation
+        shell: bash
+        run: |
+          test_dir="$(mktemp -d)"
+          trap 'rm -rf "$test_dir"' EXIT
+          cp dist/*.tar.gz dist/*.zip dist/checksums.txt "$test_dir/"
+          corrupt="$(find "$test_dir" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort | sed -n '2p')"
+          test -n "$corrupt"
+          printf 'corrupt' >>"$corrupt"
+          if go run ./cmd/releasecheck -dist "$test_dir" -smoke=false; then
+            echo "release validation accepted a corrupted non-first archive" >&2
+            exit 1
+          fi

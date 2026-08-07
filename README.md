@@ -1,10 +1,25 @@
 # Relaybox
 
+[![CI](https://github.com/1337lean/relaybox/actions/workflows/ci.yml/badge.svg)](https://github.com/1337lean/relaybox/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/1337lean/relaybox/actions/workflows/codeql.yml/badge.svg)](https://github.com/1337lean/relaybox/actions/workflows/codeql.yml)
+[![Release](https://img.shields.io/github/v/release/1337lean/relaybox?display_name=tag)](https://github.com/1337lean/relaybox/releases)
+
 Relaybox is a standard-library-only webhook inbox. It durably captures requests, verifies GitHub HMAC signatures, atomically suppresses duplicates, forwards through a fixed target with bounded retries, and exposes an authenticated browser inspector.
 
-## Quick start
+## Install
 
 Requires Go 1.25.
+
+After the first tagged release, install the CLI directly:
+
+```sh
+go install github.com/1337lean/relaybox/cmd/relaybox@latest
+relaybox version
+```
+
+Until then, run the current source checkout with `go run ./cmd/relaybox` as shown below. Tagged releases provide checksummed Linux, macOS, and Windows archives for `amd64` and `arm64`, plus SBOMs and provenance attestations, and publish the container to `ghcr.io/1337lean/relaybox`. See [releasing](docs/releasing.md) for the verification and publication flow.
+
+## Quick start
 
 ```sh
 RELAYBOX_OPERATOR_TOKEN='replace-with-a-long-random-value' \
@@ -42,7 +57,7 @@ The append-only NDJSON log is synced for every event. Capture, deduplication, an
 
 Retention defaults to 1,000 captures and eight jobs per capture. Completed oldest data is evicted durably; unfinished forwarding is never evicted, and a full store returns `507 Insufficient Storage`. Search uses a bounded body-prefix index outside the store lock. SSE resumes from a bounded sequence ring rather than scanning the log.
 
-Sensitive headers, including API keys, are redacted before persistence and removed from forwarding. Add organization-specific names with `RELAYBOX_SENSITIVE_HEADERS`. If a destination needs authentication, set `RELAYBOX_FORWARD_AUTHORIZATION`; it is injected at send time and is not stored with captures.
+Sensitive headers, including normalized API-key, authentication, credential, cookie, signature, secret, and token names, are redacted before persistence and removed from forwarding. Add organization-specific names with `RELAYBOX_SENSITIVE_HEADERS`. If a destination needs authentication, set `RELAYBOX_FORWARD_AUTHORIZATION`; it is injected at send time and is not stored with captures.
 
 Redirects and outbound environment proxies are disabled. Targets must be configured by the operator; replay cannot supply a URL. Public destinations are allowed by default, while loopback, private, link-local, multicast, and unspecified addresses are blocked at dial time (including DNS results). Hop-by-hop headers and spoofable forwarding/Relaybox identity headers are removed before delivery. `-allow-private-targets` disables the IP protection and is for controlled development only.
 
@@ -56,14 +71,23 @@ docker compose up --build
 
 Compose passes secrets through the environment rather than command arguments, publishes only to host loopback, drops Linux capabilities, enables `no-new-privileges`, and makes the container root filesystem read-only. The scratch runtime includes CA roots for HTTPS forwarding and uses the real readiness command.
 
-See [architecture](docs/architecture.md), [operations](docs/operations.md), and [threat model](docs/threat-model.md).
+See [architecture](docs/architecture.md), [operations](docs/operations.md), [threat model](docs/threat-model.md), and [releasing](docs/releasing.md).
 
 ## Development
 
 ```sh
 gofmt -w .
 go vet ./...
-go test ./...
 go test -race ./...
+go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+go run github.com/goreleaser/goreleaser/v2@v2.17.1 check
 go build ./cmd/relaybox
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
+## License
+
+Relaybox is available under the [MIT License](LICENSE). Notices for code redistributed in binaries and container images are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and included in release artifacts.

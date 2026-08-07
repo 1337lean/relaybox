@@ -4,69 +4,124 @@ on:
   push:
     tags: ['v*']
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
-  actions: read
-  attestations: write
-  contents: write
-  id-token: write
-  packages: write
+  contents: read
 
 jobs:
-  verify-and-publish:
+  verify:
+    name: verify-release-candidate
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      bundle-sha256: ${{ steps.bundle.outputs.sha256 }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.25.x'
           cache: false
-      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
-      - name: Set release image name
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}" >>"$GITHUB_ENV"
-
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Configure local image name
+        run: echo "LOCAL_IMAGE=relaybox-verified:$GITHUB_SHA" >>"$GITHUB_ENV"
+      - name: Validate semantic release tag
+        run: go run ./cmd/releasecheck -validate-tag "$GITHUB_REF_NAME"
+      - name: Refuse to overwrite an existing GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")
+          case "$status" in
+            404) ;;
+            200) echo "::error::GitHub release $GITHUB_REF_NAME already exists; refusing a rebuild"; exit 1 ;;
+            *) echo "::error::Unable to prove release absence (GitHub API status $status)"; exit 1 ;;
+          esac
+      - name: Bind source to protected main and the remote tag
+        shell: bash
+        run: |
+          git fetch --force --no-tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+          tag_ref=""
+          peeled_ref=""
+          while read -r object ref; do
+            case "$ref" in
+              "refs/tags/$GITHUB_REF_NAME") tag_ref=$object ;;
+              "refs/tags/$GITHUB_REF_NAME^{}") peeled_ref=$object ;;
+            esac
+          done < <(git ls-remote origin "refs/tags/$GITHUB_REF_NAME" "refs/tags/$GITHUB_REF_NAME^{}")
+          remote_commit=${peeled_ref:-$tag_ref}
+          test -n "$remote_commit"
+          test "$remote_commit" = "$GITHUB_SHA"
+      - name: Verify clean go install from tag
+        shell: bash
+        run: |
+          install_dir=$(mktemp -d)
+          GOBIN="$install_dir/bin" GOCACHE="$install_dir/build-cache" \
+            GOMODCACHE="$install_dir/mod-cache" GOPROXY=direct GOWORK=off \
+            go install "github.com/1337lean/relaybox/cmd/relaybox@$GITHUB_REF_NAME"
+          test "$("$install_dir/bin/relaybox" version)" = "relaybox ${GITHUB_REF_NAME#v}"
       - name: Verify source
         run: |
           test -z "$(gofmt -l .)"
-          npx --yes markdownlint-cli2@0.20.0 README.md CONTRIBUTING.md SECURITY.md 'docs/*.md'
+          npx --yes markdownlint-cli2@0.20.0 README.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md 'docs/*.md' '.github/**/*.md'
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           go vet ./...
           go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
           go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
           go test -race ./...
+      - name: Confirm verification did not modify the source tree
+        run: test -z "$(git status --porcelain --untracked-files=all)"
       - name: Validate release configuration
-        uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
-          version: v2.17.0
+          version: v2.17.1
           args: check
       - name: Build without publishing
-        uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
-          version: v2.17.0
+          version: v2.17.1
           args: release --skip=publish --clean
-      - name: Verify archives, checksums, and version metadata
-        run: ./scripts/verify-release.sh "${GITHUB_REF_NAME}"
+      - name: Verify archives, checksums, binaries, and version
+        run: ./scripts/verify-release.sh "$GITHUB_REF_NAME"
       - name: Generate source SBOM
         run: |
           go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod \
             -json -output dist/relaybox-source.cdx.json
-          sha256sum dist/relaybox-source.cdx.json >>dist/checksums.txt
-
+      - name: Confirm build tooling did not modify the source tree
+        run: test -z "$(git status --porcelain --untracked-files=all)"
       - name: Build release image locally
         run: |
           version=${GITHUB_REF_NAME#v}
-          docker buildx build --load --build-arg "VERSION=$version" --tag "$IMAGE" .
-          test "$(docker run --rm "$IMAGE" version)" = "relaybox $version"
+          docker buildx build --load --build-arg "VERSION=$version" --build-arg "REVISION=$GITHUB_SHA" --tag "$LOCAL_IMAGE" .
+          test "$(docker run --rm "$LOCAL_IMAGE" version)" = "relaybox $version"
+          test "$(docker image inspect "$LOCAL_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
+          test "$(docker image inspect "$LOCAL_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
       - name: Verify release image runtime and restart
-        run: ./scripts/container-smoke.sh "$IMAGE"
+        run: ./scripts/container-smoke.sh "$LOCAL_IMAGE"
       - name: Generate image SBOM
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.IMAGE }}
+          image-ref: ${{ env.LOCAL_IMAGE }}
           version: v0.73.0
           format: cyclonedx
           output: dist/relaybox-image.cdx.json
@@ -74,76 +129,360 @@ jobs:
       - name: Scan release image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.IMAGE }}
+          image-ref: ${{ env.LOCAL_IMAGE }}
           version: v0.73.0
           format: table
           exit-code: '1'
           ignore-unfixed: true
           severity: HIGH,CRITICAL
           scan-type: image
-      - name: Add image SBOM checksum
+      - name: Reverify archives after all build tools
+        run: ./scripts/verify-release.sh "$GITHUB_REF_NAME"
+      - name: Assemble exact verified bundle
+        id: bundle
+        shell: bash
         run: |
-          sha256sum dist/relaybox-image.cdx.json >>dist/checksums.txt
-          (cd dist && sha256sum --check checksums.txt)
-      - name: Preserve verified artifacts
+          mkdir -p bundle/release bundle/image
+          cp dist/*.tar.gz dist/*.zip bundle/release/
+          cp dist/relaybox-source.cdx.json dist/relaybox-image.cdx.json bundle/release/
+          docker image inspect "$LOCAL_IMAGE" --format '{{.Id}}' >bundle/image/relaybox-image.id
+          docker save --output bundle/image/relaybox-image.tar "$LOCAL_IMAGE"
+          (
+            cd bundle/release
+            sha256sum ./*.tar.gz ./*.zip relaybox-source.cdx.json relaybox-image.cdx.json \
+              | sed 's#  \./#  #' >checksums.txt
+            sha256sum --check checksums.txt
+          )
+          (
+            cd bundle
+            LC_ALL=C find release image -type f -print0 \
+              | LC_ALL=C sort -z | xargs -0 sha256sum >bundle-manifest.txt
+            sha256sum bundle-manifest.txt >bundle.sha256
+          )
+          bundle_sha256=$(cut -d' ' -f1 bundle/bundle.sha256)
+          test -n "$bundle_sha256"
+          echo "sha256=$bundle_sha256" >>"$GITHUB_OUTPUT"
+      - name: Preserve only the verified bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: relaybox-${{ github.ref_name }}-verified
-          path: dist
+          name: relaybox-${{ github.ref_name }}-${{ github.sha }}
+          path: bundle
           if-no-files-found: error
+          retention-days: 7
 
-      # No publication occurs before this point. Every source, archive, image,
-      # runtime, checksum, SBOM, and vulnerability check above must pass first.
-      - name: Create draft release with verified artifacts
+  attest-artifacts:
+    name: attest-verified-artifacts
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download verified bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: relaybox-${{ github.ref_name }}-${{ github.sha }}
+          path: bundle
+      - name: Reverify exact bundle
+        shell: bash
+        run: |
+          test "$(cut -d' ' -f1 bundle/bundle.sha256)" = "${{ needs.verify.outputs.bundle-sha256 }}"
+          (
+            cd bundle
+            sha256sum --check bundle.sha256
+            sha256sum --check bundle-manifest.txt
+            (cd release && sha256sum --check checksums.txt)
+            find . -type f -printf '%P\n' | LC_ALL=C sort >../actual-files.txt
+            { awk '{print $2}' bundle-manifest.txt; printf '%s\n' bundle-manifest.txt bundle.sha256; } \
+              | LC_ALL=C sort >../expected-files.txt
+          )
+          diff -u expected-files.txt actual-files.txt
+      - name: Revalidate tag and protected-main ancestry
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            dist/*.tar.gz dist/*.zip dist/checksums.txt \
-            dist/relaybox-source.cdx.json dist/relaybox-image.cdx.json \
-            --draft --generate-notes --title "$GITHUB_REF_NAME" --verify-tag
-      - name: Attest archives, checksums, and SBOMs
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+          tag_ref=""
+          peeled_ref=""
+          while read -r object ref; do
+            case "$ref" in
+              "refs/tags/$GITHUB_REF_NAME") tag_ref=$object ;;
+              "refs/tags/$GITHUB_REF_NAME^{}") peeled_ref=$object ;;
+            esac
+          done < <(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/tags/$GITHUB_REF_NAME" "refs/tags/$GITHUB_REF_NAME^{}")
+          remote_commit=${peeled_ref:-$tag_ref}
+          test -n "$remote_commit"
+          test "$remote_commit" = "$GITHUB_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq '.merge_base_commit.sha')" = "$GITHUB_SHA"
+      - name: Attest every verified release object
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/checksums.txt
-            dist/*.cdx.json
+          subject-path: bundle/release/*
+
+  publish-image:
+    name: publish-signed-image
+    needs: [verify, attest-artifacts]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      image-digest: ${{ steps.image.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download verified bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: relaybox-${{ github.ref_name }}-${{ github.sha }}
+          path: bundle
+      - name: Reverify exact bundle
+        shell: bash
+        run: |
+          test "$(cut -d' ' -f1 bundle/bundle.sha256)" = "${{ needs.verify.outputs.bundle-sha256 }}"
+          (
+            cd bundle
+            sha256sum --check bundle.sha256
+            sha256sum --check bundle-manifest.txt
+            (cd release && sha256sum --check checksums.txt)
+            find . -type f -printf '%P\n' | LC_ALL=C sort >../actual-files.txt
+            { awk '{print $2}' bundle-manifest.txt; printf '%s\n' bundle-manifest.txt bundle.sha256; } \
+              | LC_ALL=C sort >../expected-files.txt
+          )
+          diff -u expected-files.txt actual-files.txt
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Load the verified image
+        shell: bash
+        run: |
+          echo "LOCAL_IMAGE=relaybox-verified:$GITHUB_SHA" >>"$GITHUB_ENV"
+          repository=${GITHUB_REPOSITORY,,}
+          bundle_sha=${{ needs.verify.outputs.bundle-sha256 }}
+          [[ "$bundle_sha" =~ ^[0-9a-f]{64}$ ]]
+          echo "STAGING_IMAGE=ghcr.io/$repository:build-$GITHUB_SHA-${bundle_sha:0:32}-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >>"$GITHUB_ENV"
+          echo "RELEASE_IMAGE=ghcr.io/$repository:$GITHUB_REF_NAME" >>"$GITHUB_ENV"
+          docker load --input bundle/image/relaybox-image.tar
+          test "$(docker image inspect "relaybox-verified:$GITHUB_SHA" --format '{{.Id}}')" = "$(cat bundle/image/relaybox-image.id)"
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push verified image
-        run: docker push "$IMAGE"
+      - name: Revalidate tag and push immutable staging image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag_ref=""
+          peeled_ref=""
+          while read -r object ref; do
+            case "$ref" in
+              "refs/tags/$GITHUB_REF_NAME") tag_ref=$object ;;
+              "refs/tags/$GITHUB_REF_NAME^{}") peeled_ref=$object ;;
+            esac
+          done < <(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/tags/$GITHUB_REF_NAME" "refs/tags/$GITHUB_REF_NAME^{}")
+          remote_commit=${peeled_ref:-$tag_ref}
+          test -n "$remote_commit"
+          test "$remote_commit" = "$GITHUB_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq '.merge_base_commit.sha')" = "$GITHUB_SHA"
+
+          repository=${GITHUB_REPOSITORY,,}
+          registry_token=$(curl --fail --silent --show-error --location --get \
+            --user "$GITHUB_ACTOR:$GH_TOKEN" \
+            --data-urlencode 'service=ghcr.io' \
+            --data-urlencode "scope=repository:$repository:pull,push" \
+            https://ghcr.io/token | jq -er '.token')
+          status=$(curl --silent --show-error --head --output /dev/null --write-out '%{http_code}' \
+            --header "Authorization: Bearer $registry_token" \
+            --header 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/$repository/manifests/${STAGING_IMAGE##*:}")
+          case "$status" in
+            404) ;;
+            200) echo "::error::Immutable staging tag already exists; refusing to overwrite it"; exit 1 ;;
+            *) echo "::error::Unable to prove staging-tag absence (GHCR status $status)"; exit 1 ;;
+          esac
+          docker tag "$LOCAL_IMAGE" "$STAGING_IMAGE"
+          docker push "$STAGING_IMAGE"
       - name: Resolve pushed image digest
         id: image
+        shell: bash
         run: |
-          reference=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')
+          reference=$(docker image inspect "$STAGING_IMAGE" --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+            | grep '^ghcr.io/' | head -n 1)
           digest=${reference##*@}
+          test -n "$reference"
           test -n "$digest"
           echo "reference=$reference" >>"$GITHUB_OUTPUT"
           echo "digest=$digest" >>"$GITHUB_OUTPUT"
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-release: v3.0.6
-      - name: Sign image with GitHub OIDC
+          cosign-release: v3.1.3
+      - name: Sign image and attach its verified SBOM
         run: |
           cosign sign --yes "${{ steps.image.outputs.reference }}"
           cosign attest --yes \
-            --predicate dist/relaybox-image.cdx.json \
+            --predicate bundle/release/relaybox-image.cdx.json \
             --type cyclonedx \
             "${{ steps.image.outputs.reference }}"
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
-      - name: Publish verified release
+      - name: Revalidate tag and publish signed release image tag
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+        shell: bash
+        run: |
+          tag_ref=""
+          peeled_ref=""
+          while read -r object ref; do
+            case "$ref" in
+              "refs/tags/$GITHUB_REF_NAME") tag_ref=$object ;;
+              "refs/tags/$GITHUB_REF_NAME^{}") peeled_ref=$object ;;
+            esac
+          done < <(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/tags/$GITHUB_REF_NAME" "refs/tags/$GITHUB_REF_NAME^{}")
+          remote_commit=${peeled_ref:-$tag_ref}
+          test -n "$remote_commit"
+          test "$remote_commit" = "$GITHUB_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq '.merge_base_commit.sha')" = "$GITHUB_SHA"
+
+          release_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")
+          case "$release_status" in
+            404) ;;
+            200) echo "::error::GitHub release appeared during this run; refusing image-tag mutation"; exit 1 ;;
+            *) echo "::error::Unable to prove release absence (GitHub API status $release_status)"; exit 1 ;;
+          esac
+
+          repository=${GITHUB_REPOSITORY,,}
+          registry_token=$(curl --fail --silent --show-error --location --get \
+            --user "$GITHUB_ACTOR:$GH_TOKEN" \
+            --data-urlencode 'service=ghcr.io' \
+            --data-urlencode "scope=repository:$repository:pull,push" \
+            https://ghcr.io/token | jq -er '.token')
+          headers=$(mktemp)
+          status=$(curl --silent --show-error --head --output "$headers" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $registry_token" \
+            --header 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/$repository/manifests/$GITHUB_REF_NAME")
+          case "$status" in
+            200)
+              existing_digest=$(tr -d '\r' <"$headers" | awk -F': ' 'tolower($1) == "docker-content-digest" {print $2}')
+              test -n "$existing_digest"
+              if [ "$existing_digest" != "${{ steps.image.outputs.digest }}" ]; then
+                echo "::error::Release image tag already points to a different digest; refusing to overwrite it"
+                exit 1
+              fi
+              ;;
+            404)
+              docker buildx imagetools create --prefer-index=false \
+                --tag "$RELEASE_IMAGE" "${{ steps.image.outputs.reference }}"
+              ;;
+            *) echo "::error::Unable to inspect release image tag (GHCR status $status)"; exit 1 ;;
+          esac
+          test "$(docker buildx imagetools inspect "$RELEASE_IMAGE" --format '{{.Manifest.Digest}}')" = "${{ steps.image.outputs.digest }}"
+
+  publish-release:
+    name: publish-release
+    needs: [verify, attest-artifacts, publish-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - name: Download verified bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: relaybox-${{ github.ref_name }}-${{ github.sha }}
+          path: bundle
+      - name: Reverify exact bundle
+        shell: bash
+        run: |
+          test "$(cut -d' ' -f1 bundle/bundle.sha256)" = "${{ needs.verify.outputs.bundle-sha256 }}"
+          (
+            cd bundle
+            sha256sum --check bundle.sha256
+            sha256sum --check bundle-manifest.txt
+            (cd release && sha256sum --check checksums.txt)
+            find . -type f -printf '%P\n' | LC_ALL=C sort >../actual-files.txt
+            { awk '{print $2}' bundle-manifest.txt; printf '%s\n' bundle-manifest.txt bundle.sha256; } \
+              | LC_ALL=C sort >../expected-files.txt
+          )
+          diff -u expected-files.txt actual-files.txt
+      - name: Require a public container package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          owner=${GITHUB_REPOSITORY%%/*}
+          package=${GITHUB_REPOSITORY#*/}
+          owner_type=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.owner.type')
+          case "$owner_type" in
+            Organization) endpoint="orgs/$owner/packages/container/$package" ;;
+            User) endpoint="users/$owner/packages/container/$package" ;;
+            *) echo "Unsupported repository owner type: $owner_type" >&2; exit 1 ;;
+          esac
+          if ! visibility=$(gh api "$endpoint" --jq '.visibility'); then
+            echo "::error::Unable to read a public relaybox package; make the GHCR package public, then rerun this job"
+            exit 1
+          fi
+          if [ "$visibility" != public ]; then
+            echo "::error::ghcr.io/$GITHUB_REPOSITORY is $visibility; make the package public, then rerun this job"
+            exit 1
+          fi
+          repository=${GITHUB_REPOSITORY,,}
+          anonymous_token=$(curl --fail --silent --show-error --location --get \
+            --data-urlencode 'service=ghcr.io' \
+            --data-urlencode "scope=repository:$repository:pull" \
+            https://ghcr.io/token | jq -er '.token')
+          public_digest=$(curl --fail --silent --show-error --head \
+            --header "Authorization: Bearer $anonymous_token" \
+            --header 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/$repository/manifests/$GITHUB_REF_NAME" \
+            | tr -d '\r' | awk -F': ' 'tolower($1) == "docker-content-digest" {print $2}')
+          test "$public_digest" = "${{ needs.publish-image.outputs.image-digest }}"
+      - name: Revalidate tag and publish verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag_ref=""
+          peeled_ref=""
+          while read -r object ref; do
+            case "$ref" in
+              "refs/tags/$GITHUB_REF_NAME") tag_ref=$object ;;
+              "refs/tags/$GITHUB_REF_NAME^{}") peeled_ref=$object ;;
+            esac
+          done < <(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/tags/$GITHUB_REF_NAME" "refs/tags/$GITHUB_REF_NAME^{}")
+          remote_commit=${peeled_ref:-$tag_ref}
+          test -n "$remote_commit"
+          test "$remote_commit" = "$GITHUB_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq '.merge_base_commit.sha')" = "$GITHUB_SHA"
+          release_flags=()
+          if [[ "${GITHUB_REF_NAME#v}" == *-* ]]; then
+            release_flags+=(--prerelease)
+          else
+            release_flags+=(--latest)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            bundle/release/*.tar.gz bundle/release/*.zip bundle/release/checksums.txt \
+            bundle/release/relaybox-source.cdx.json bundle/release/relaybox-image.cdx.json \
+            --repo "$GITHUB_REPOSITORY" --generate-notes \
+            --title "$GITHUB_REF_NAME" --verify-tag "${release_flags[@]}"

@@ -75,7 +75,12 @@ func (o Options) withDefaults() Options {
 }
 
 type Store struct {
-	mu            sync.RWMutex
+	mu sync.RWMutex
+	// fileMu protects the lifetime of f while body payloads are read with
+	// ReadAt. Lock ordering is always mu, then fileMu. Ordinary appends can run
+	// alongside payload reads; compaction and Close take the exclusive lock
+	// before replacing or closing the descriptor.
+	fileMu        sync.RWMutex
 	path          string
 	f             *os.File
 	opts          Options
@@ -88,6 +93,9 @@ type Store struct {
 	jobsByRequest map[string]map[string]struct{}
 	delivery      map[string]string
 	body          map[string]string
+	requestRecord map[string]recordRef
+	requestBytes  map[string]int
+	attemptRecord map[string]recordRef
 	search        map[string]string
 	subs          map[chan Event]struct{}
 	ring          []Event
@@ -96,6 +104,12 @@ type Store struct {
 	closed        bool
 	beforeWrite   func(Event) error
 	beforeSync    func(Event) error
+}
+
+type recordRef struct {
+	offset int64
+	length int
+	seq    uint64
 }
 
 func Open(path string) (*Store, error) {
@@ -134,6 +148,9 @@ func OpenWithOptions(path string, opts Options) (*Store, error) {
 		jobsByRequest: map[string]map[string]struct{}{},
 		delivery:      map[string]string{},
 		body:          map[string]string{},
+		requestRecord: map[string]recordRef{},
+		requestBytes:  map[string]int{},
+		attemptRecord: map[string]recordRef{},
 		search:        map[string]string{},
 		subs:          map[chan Event]struct{}{},
 	}
@@ -154,6 +171,7 @@ func (s *Store) recover() error {
 	}
 	r := bufio.NewReaderSize(s.f, 64<<10)
 	var good int64
+	seenMutation := false
 	for {
 		line, complete, err := readRecord(r)
 		if err != nil {
@@ -175,8 +193,15 @@ func (s *Store) recover() error {
 		if err := s.validateStateLocked(event); err != nil {
 			return fmt.Errorf("invalid store state at byte %d: %w", good, err)
 		}
-		s.apply(event)
-		s.eventCount++
+		if event.Snapshot {
+			if seenMutation {
+				return fmt.Errorf("invalid store snapshot at byte %d: snapshot record follows a mutation", good)
+			}
+		} else {
+			seenMutation = true
+			s.eventCount++
+		}
+		s.apply(event, recordRef{offset: good, length: len(line), seq: event.Seq})
 		good += int64(len(line))
 	}
 	st, err := s.f.Stat()
@@ -351,7 +376,7 @@ func cloneEvent(e Event) Event {
 	return e
 }
 
-func (s *Store) apply(e Event) {
+func (s *Store) apply(e Event, ref recordRef) {
 	if e.Seq > s.seq {
 		s.seq = e.Seq
 	}
@@ -363,13 +388,17 @@ func (s *Store) apply(e Event) {
 	}
 	if e.Request != nil {
 		r := cloneRequest(*e.Request)
+		body := r.Body
+		r.Body = nil
 		s.requests[r.ID] = r
+		s.requestRecord[r.ID] = ref
+		s.requestBytes[r.ID] = len(body)
 		if r.DeliveryID != "" {
 			s.delivery[r.DeliveryID] = r.ID
 		} else {
 			s.body[r.BodySHA256] = r.ID
 		}
-		searchBody := r.Body
+		searchBody := body
 		if len(searchBody) > s.opts.MaxSearchBytes {
 			searchBody = searchBody[:s.opts.MaxSearchBytes]
 		}
@@ -377,8 +406,10 @@ func (s *Store) apply(e Event) {
 	}
 	if e.Attempt != nil {
 		a := cloneAttempt(*e.Attempt)
+		a.ResponseBody = nil
 		s.attempts[a.RequestID] = append(s.attempts[a.RequestID], a)
 		s.attemptIDs[a.ID] = struct{}{}
+		s.attemptRecord[a.ID] = ref
 	}
 	if e.Job != nil {
 		j := *e.Job
@@ -420,8 +451,11 @@ func (s *Store) removeRequest(id string) {
 	delete(s.requests, id)
 	for _, a := range s.attempts[id] {
 		delete(s.attemptIDs, a.ID)
+		delete(s.attemptRecord, a.ID)
 	}
 	delete(s.attempts, id)
+	delete(s.requestRecord, id)
+	delete(s.requestBytes, id)
 	delete(s.search, id)
 }
 
@@ -444,6 +478,7 @@ func (s *Store) removeJob(id string) {
 			kept = append(kept, a)
 		} else {
 			delete(s.attemptIDs, a.ID)
+			delete(s.attemptRecord, a.ID)
 		}
 	}
 	if len(kept) == 0 {
@@ -462,6 +497,9 @@ func (s *Store) appendLocked(e Event) (Event, error) {
 	}
 	s.seq++
 	e.Seq = s.seq
+	// Snapshot is storage metadata assigned only while compaction rewrites the
+	// current state. Callers cannot turn ordinary mutations into snapshot data.
+	e.Snapshot = false
 	if e.At.IsZero() {
 		e.At = time.Now().UTC()
 	}
@@ -486,6 +524,15 @@ func (s *Store) appendLocked(e Event) (Event, error) {
 		return Event{}, err
 	}
 	b = append(b, '\n')
+	if len(b) > maxEventBytes {
+		s.seq--
+		return Event{}, fmt.Errorf("event exceeds %d bytes", maxEventBytes)
+	}
+	offset, err := s.f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		s.seq--
+		return Event{}, err
+	}
 	n, writeErr := s.f.Write(b)
 	if writeErr != nil || n != len(b) {
 		if writeErr == nil {
@@ -504,7 +551,7 @@ func (s *Store) appendLocked(e Event) (Event, error) {
 		s.health = err
 		return Event{}, err
 	}
-	s.apply(e)
+	s.apply(e, recordRef{offset: offset, length: len(b), seq: e.Seq})
 	s.eventCount++
 	if s.eventCount > s.opts.MaxEvents {
 		if err := s.compactLocked(); err != nil {
@@ -534,14 +581,31 @@ func (s *Store) Append(e Event) (Event, error) {
 func (s *Store) Accept(r Request, job *Job) (string, CaptureResult, *Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if job != nil && (job.ID == "" || job.RequestID != r.ID || job.State != "pending") {
+		return "", Captured, nil, errors.New("invalid capture forwarding intent")
+	}
 	if id, result, ok := s.duplicateLocked(r); ok {
-		return id, result, s.discoverableJobLocked(id), nil
+		persisted := s.discoverableJobLocked(id)
+		// Stores created before atomic capture intents (and captures accepted
+		// while forwarding was disabled) can legitimately have no job. A
+		// duplicate delivered after forwarding is configured repairs that legacy
+		// state under the same idempotency lock instead of acknowledging a request
+		// that still has no discoverable delivery intent.
+		if result == Duplicate && job != nil && persisted == nil {
+			if _, exists := s.jobs[job.ID]; exists {
+				return id, result, nil, fmt.Errorf("job: %w", ErrIDCollision)
+			}
+			repaired := *job
+			repaired.RequestID = id
+			if _, err := s.appendLocked(Event{Kind: "forward.pending", Job: &repaired}); err != nil {
+				return id, result, nil, err
+			}
+			persisted = &repaired
+		}
+		return id, result, persisted, nil
 	}
 	if _, exists := s.requests[r.ID]; exists {
 		return "", Captured, nil, fmt.Errorf("request: %w", ErrIDCollision)
-	}
-	if job != nil && (job.RequestID != r.ID || job.State != "pending") {
-		return "", Captured, nil, errors.New("invalid capture forwarding intent")
 	}
 	if job != nil {
 		if _, exists := s.jobs[job.ID]; exists {
@@ -789,18 +853,235 @@ func (s *Store) FinishWithoutAttempt(jobID, owner, state, message string) error 
 	return err
 }
 
-func (s *Store) Get(id string) (Request, []Attempt, bool) {
+// Load returns one capture and its attempts. Payload bytes are loaded on
+// demand from the already-open append log so startup and steady-state memory
+// retain metadata and bounded search prefixes rather than every body.
+func (s *Store) Load(id string) (Request, []Attempt, bool, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	r, ok := s.requests[id]
 	if !ok {
-		return Request{}, nil, false
+		s.mu.RUnlock()
+		return Request{}, nil, false, nil
 	}
-	a := make([]Attempt, len(s.attempts[id]))
-	for i := range a {
-		a[i] = cloneAttempt(s.attempts[id][i])
+	r = cloneRequest(r)
+	requestRef := s.requestRecord[id]
+	attempts := make([]Attempt, len(s.attempts[id]))
+	attemptRefs := make([]recordRef, len(attempts))
+	for i := range attempts {
+		attempts[i] = cloneAttempt(s.attempts[id][i])
+		attemptRefs[i] = s.attemptRecord[attempts[i].ID]
 	}
-	return cloneRequest(r), a, true
+	// Acquire fileMu before releasing mu so compaction cannot swap and close
+	// the descriptor between the metadata snapshot and the corresponding
+	// positional reads.
+	s.fileMu.RLock()
+	f := s.f
+	s.mu.RUnlock()
+
+	loadErr := func() error {
+		defer s.fileMu.RUnlock()
+		event, err := readEventAt(f, requestRef)
+		if err != nil {
+			return fmt.Errorf("load request %q: %w", id, err)
+		}
+		if event.Request == nil || event.Request.ID != id {
+			return fmt.Errorf("load request %q: store record identity changed", id)
+		}
+		if err := validateRequestDigest(*event.Request); err != nil {
+			return fmt.Errorf("load request %q: %w", id, err)
+		}
+		r.Body = append([]byte(nil), event.Request.Body...)
+		for i := range attempts {
+			event, err := readEventAt(f, attemptRefs[i])
+			if err != nil {
+				return fmt.Errorf("load attempt %q: %w", attempts[i].ID, err)
+			}
+			if event.Attempt == nil || event.Attempt.ID != attempts[i].ID {
+				return fmt.Errorf("load attempt %q: store record identity changed", attempts[i].ID)
+			}
+			attempts[i].ResponseBody = append([]byte(nil), event.Attempt.ResponseBody...)
+		}
+		return nil
+	}()
+	if loadErr != nil {
+		s.poison(loadErr)
+		return Request{}, nil, false, loadErr
+	}
+	return r, attempts, true, nil
+}
+
+// Get is retained for callers that only need the historical boolean lookup
+// API. Production request and forwarding paths use Load so I/O failures are
+// surfaced rather than mistaken for a missing capture.
+func (s *Store) Get(id string) (Request, []Attempt, bool) {
+	r, attempts, ok, _ := s.Load(id)
+	return r, attempts, ok
+}
+
+// RedactHeaders replaces matching retained request and attempt header values
+// and compacts the store when a legacy plaintext value is found. The caller
+// supplies the policy so application-specific header names are migrated too.
+func (s *Store) RedactHeaders(sensitive func(string) bool) error {
+	if sensitive == nil {
+		return errors.New("sensitive header policy is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return os.ErrClosed
+	}
+	if s.health != nil {
+		return fmt.Errorf("store poisoned: %w", s.health)
+	}
+	redact := func(headers Header) bool {
+		changed := false
+		for name, values := range headers {
+			if sensitive(name) && (len(values) != 1 || values[0] != "[REDACTED]") {
+				headers[name] = []string{"[REDACTED]"}
+				changed = true
+			}
+		}
+		return changed
+	}
+	changed := false
+	for id, request := range s.requests {
+		if redact(request.Headers) {
+			s.requests[id] = request
+			changed = true
+		}
+	}
+	for requestID, attempts := range s.attempts {
+		for i := range attempts {
+			if redact(attempts[i].ResponseHeaders) {
+				changed = true
+			}
+		}
+		s.attempts[requestID] = attempts
+	}
+	// Recovery also populates the SSE catch-up ring from the legacy log. Keep
+	// that in-memory presentation path redacted even if compaction cannot run.
+	for i := range s.ring {
+		if s.ring[i].Request != nil && redact(s.ring[i].Request.Headers) {
+			changed = true
+		}
+		if s.ring[i].Attempt != nil && redact(s.ring[i].Attempt.ResponseHeaders) {
+			changed = true
+		}
+	}
+	if changed {
+		s.recountRingLocked()
+	}
+	if !changed {
+		var err error
+		changed, err = s.logNeedsHeaderRedactionLocked(sensitive)
+		if err != nil {
+			s.health = err
+			return fmt.Errorf("scan legacy headers: %w", err)
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.compactLocked(); err != nil {
+		s.health = err
+		return fmt.Errorf("compact redacted store: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) recountRingLocked() {
+	s.ringBytes = 0
+	for _, event := range s.ring {
+		encoded, _ := json.Marshal(event)
+		s.ringBytes += len(encoded)
+	}
+	for len(s.ring) > s.opts.MaxCatchUpEvents || s.ringBytes > s.opts.MaxCatchUpBytes {
+		encoded, _ := json.Marshal(s.ring[0])
+		s.ringBytes -= len(encoded)
+		s.ring = s.ring[1:]
+	}
+}
+
+// logNeedsHeaderRedactionLocked scans the complete active append log so a
+// plaintext value in evicted history cannot survive merely because it aged
+// out of the retained state and bounded SSE ring. The lightweight decode skips
+// payload bodies while preserving the store's per-record size bound.
+func (s *Store) logNeedsHeaderRedactionLocked(sensitive func(string) bool) (bool, error) {
+	s.fileMu.RLock()
+	defer s.fileMu.RUnlock()
+	if s.f == nil {
+		return false, os.ErrClosed
+	}
+	info, err := s.f.Stat()
+	if err != nil {
+		return false, err
+	}
+	reader := bufio.NewReaderSize(io.NewSectionReader(s.f, 0, info.Size()), 64<<10)
+	var offset int64
+	for {
+		line, complete, err := readRecord(reader)
+		if err != nil {
+			return false, fmt.Errorf("read store at byte %d: %w", offset, err)
+		}
+		if !complete {
+			return false, nil
+		}
+		var metadata struct {
+			Request *struct {
+				Headers Header
+			} `json:"request"`
+			Attempt *struct {
+				ResponseHeaders Header
+			} `json:"attempt"`
+		}
+		if err := json.Unmarshal(line, &metadata); err != nil {
+			return false, fmt.Errorf("decode store at byte %d: %w", offset, err)
+		}
+		if metadata.Request != nil && headerValuesNeedRedaction(metadata.Request.Headers, sensitive) ||
+			metadata.Attempt != nil && headerValuesNeedRedaction(metadata.Attempt.ResponseHeaders, sensitive) {
+			return true, nil
+		}
+		offset += int64(len(line))
+	}
+}
+
+func headerValuesNeedRedaction(headers Header, sensitive func(string) bool) bool {
+	for name, values := range headers {
+		if sensitive(name) && (len(values) != 1 || values[0] != "[REDACTED]") {
+			return true
+		}
+	}
+	return false
+}
+
+func readEventAt(f *os.File, ref recordRef) (Event, error) {
+	if f == nil || ref.offset < 0 || ref.length <= 0 || ref.length > maxEventBytes {
+		return Event{}, errors.New("invalid store record reference")
+	}
+	data := make([]byte, ref.length)
+	n, err := f.ReadAt(data, ref.offset)
+	if err != nil && !(errors.Is(err, io.EOF) && n == len(data)) {
+		return Event{}, err
+	}
+	if n != len(data) {
+		return Event{}, io.ErrUnexpectedEOF
+	}
+	var event Event
+	if err := json.Unmarshal(data, &event); err != nil {
+		return Event{}, err
+	}
+	if event.Seq != ref.seq {
+		return Event{}, errors.New("store record sequence changed")
+	}
+	return event, nil
+}
+
+func (s *Store) poison(err error) {
+	s.mu.Lock()
+	if s.health == nil {
+		s.health = err
+	}
+	s.mu.Unlock()
 }
 
 type searchRecord struct {
@@ -821,7 +1102,7 @@ func (s *Store) ListSummariesContext(ctx context.Context, q string, offset, limi
 			break
 		}
 		all = append(all, searchRecord{
-			summary: RequestSummary{ID: r.ID, DeliveryID: r.DeliveryID, Method: r.Method, Path: r.Path, BodySHA256: r.BodySHA256, ReceivedAt: r.ReceivedAt, BodyBytes: len(r.Body)},
+			summary: RequestSummary{ID: r.ID, DeliveryID: r.DeliveryID, Method: r.Method, Path: r.Path, BodySHA256: r.BodySHA256, ReceivedAt: r.ReceivedAt, BodyBytes: s.requestBytes[id]},
 			index:   s.search[id],
 		})
 	}
@@ -960,11 +1241,21 @@ func (s *Store) SubscribeFrom(seq uint64) ([]Event, <-chan Event, func(), error)
 }
 
 func (s *Store) compactLocked() error {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
 	records := s.snapshotRecordsLocked()
-	if len(records) == 0 {
-		return nil
+	if uint64(len(records)) > ^uint64(0)-s.seq {
+		return errors.New("store sequence exhausted during compaction")
 	}
-	start := s.seq - uint64(len(records)) + 1
+	// Snapshot records are new durable records, not a rewriting of a
+	// one-record-per-object history. Assign them fresh sequence numbers after
+	// the last published event. This remains monotonic even when one atomic
+	// event originally carried both a request and its forwarding job.
+	previousSeq := s.seq
+	start := s.seq
+	if len(records) > 0 {
+		start++
+	}
 	dir := filepath.Dir(s.path)
 	tmp, err := os.CreateTemp(dir, ".relaybox-compact-*")
 	if err != nil {
@@ -980,12 +1271,35 @@ func (s *Store) compactLocked() error {
 		return err
 	}
 	w := bufio.NewWriterSize(tmp, 64<<10)
+	newRequestRecord := make(map[string]recordRef, len(s.requestRecord))
+	newAttemptRecord := make(map[string]recordRef, len(s.attemptRecord))
+	var offset int64
 	for i := range records {
-		records[i].Seq = start + uint64(i)
-		if err := json.NewEncoder(w).Encode(records[i]); err != nil {
+		event, err := s.hydrateSnapshotEventLocked(records[i])
+		if err != nil {
 			cleanup()
 			return err
 		}
+		event.Seq = start + uint64(i)
+		event.Snapshot = true
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			cleanup()
+			return err
+		}
+		encoded = append(encoded, '\n')
+		if _, err := w.Write(encoded); err != nil {
+			cleanup()
+			return err
+		}
+		ref := recordRef{offset: offset, length: len(encoded), seq: event.Seq}
+		if event.Request != nil {
+			newRequestRecord[event.Request.ID] = ref
+		}
+		if event.Attempt != nil {
+			newAttemptRecord[event.Attempt.ID] = ref
+		}
+		offset += int64(len(encoded))
 	}
 	if err := w.Flush(); err != nil {
 		cleanup()
@@ -1038,11 +1352,53 @@ func (s *Store) compactLocked() error {
 		return err
 	}
 	s.f = newFile
-	s.eventCount = len(records)
+	if len(records) > 0 {
+		s.seq = start + uint64(len(records)) - 1
+	} else {
+		// An empty current-state snapshot still replaces historical disk data
+		// (including evicted legacy secrets). Preserve the live cursor until a
+		// future append even though there is no record to carry a new sequence.
+		s.seq = previousSeq
+	}
+	// eventCount measures mutations since the last compaction. The compacted
+	// snapshot itself can legitimately contain more records than MaxEvents
+	// when atomic events expand into separate current-state records; counting
+	// those would otherwise trigger compaction on every subsequent append.
+	s.eventCount = 0
+	s.requestRecord = newRequestRecord
+	s.attemptRecord = newAttemptRecord
 	if oldClosed {
 		return nil
 	}
 	return old.Close()
+}
+
+func (s *Store) hydrateSnapshotEventLocked(event Event) (Event, error) {
+	event = cloneEvent(event)
+	if event.Request != nil {
+		stored, err := readEventAt(s.f, s.requestRecord[event.Request.ID])
+		if err != nil {
+			return Event{}, fmt.Errorf("read request %q for compaction: %w", event.Request.ID, err)
+		}
+		if stored.Request == nil || stored.Request.ID != event.Request.ID {
+			return Event{}, fmt.Errorf("read request %q for compaction: store record identity changed", event.Request.ID)
+		}
+		event.Request.Body = append([]byte(nil), stored.Request.Body...)
+		if err := validateRequestDigest(*event.Request); err != nil {
+			return Event{}, fmt.Errorf("read request %q for compaction: %w", event.Request.ID, err)
+		}
+	}
+	if event.Attempt != nil {
+		stored, err := readEventAt(s.f, s.attemptRecord[event.Attempt.ID])
+		if err != nil {
+			return Event{}, fmt.Errorf("read attempt %q for compaction: %w", event.Attempt.ID, err)
+		}
+		if stored.Attempt == nil || stored.Attempt.ID != event.Attempt.ID {
+			return Event{}, fmt.Errorf("read attempt %q for compaction: store record identity changed", event.Attempt.ID)
+		}
+		event.Attempt.ResponseBody = append([]byte(nil), stored.Attempt.ResponseBody...)
+	}
+	return event, nil
 }
 
 func (s *Store) snapshotRecordsLocked() []Event {
@@ -1112,5 +1468,7 @@ func (s *Store) Close() error {
 		close(ch)
 		delete(s.subs, ch)
 	}
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
 	return s.f.Close()
 }

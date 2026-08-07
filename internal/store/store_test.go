@@ -311,6 +311,42 @@ func TestDuplicateKeepsOriginalIntentDiscoverable(t *testing.T) {
 	}
 }
 
+func TestDuplicateRepairsMissingLegacyForwardIntent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.ndjson")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	original := validRequest("request-1", "delivery-1", "body", now)
+	if _, result, err := s.Capture(original); err != nil || result != Captured {
+		t.Fatalf("legacy capture = %v %v", result, err)
+	}
+	duplicate := original
+	duplicate.ID = "request-2"
+	intent := Job{ID: "job-1", RequestID: duplicate.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: now.Add(time.Second)}
+	id, result, repaired, err := s.Accept(duplicate, &intent)
+	if err != nil || result != Duplicate || id != original.ID || repaired == nil {
+		t.Fatalf("repair = %q %v %#v %v", id, result, repaired, err)
+	}
+	if repaired.RequestID != original.ID || repaired.ID != intent.ID || s.JobCounts()["pending"] != 1 {
+		t.Fatalf("repaired intent = %#v, counts = %#v", repaired, s.JobCounts())
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	unfinished := s.UnfinishedJobs()
+	if len(unfinished) != 1 || unfinished[0].RequestID != original.ID {
+		t.Fatalf("recovered repaired intent = %#v", unfinished)
+	}
+}
+
 func TestGeneratedRequestAndJobIDsCannotOverwriteState(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "store.ndjson"))
 	if err != nil {
@@ -414,6 +450,211 @@ func TestRetentionEvictionCompactionAndRecovery(t *testing.T) {
 		if _, _, ok := s.Get(id); !ok {
 			t.Fatalf("retained capture %s missing", id)
 		}
+	}
+}
+
+func TestCompactionSequenceHandlesAtomicEventExpansion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.ndjson")
+	const captures = 101
+	s, err := OpenWithOptions(path, Options{MaxCaptures: 200, MaxEvents: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for i := 0; i < captures; i++ {
+		request := validRequest(fmt.Sprintf("request-%03d", i), fmt.Sprintf("delivery-%03d", i), fmt.Sprintf("body-%03d", i), now.Add(time.Duration(i)*time.Second))
+		job := Job{ID: fmt.Sprintf("job-%03d", i), RequestID: request.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: request.ReceivedAt}
+		if _, result, _, err := s.Accept(request, &job); err != nil || result != Captured {
+			t.Fatalf("capture %d = %v %v", i, result, err)
+		}
+	}
+	// The first 101 events expand to 202 current-state snapshot records. Their
+	// fresh sequence range must follow 101 rather than underflow uint64.
+	if got := s.Sequence(); got != 303 {
+		t.Fatalf("post-compaction sequence = %d, want 303", got)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = OpenWithOptions(path, Options{MaxCaptures: 200, MaxEvents: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if len(s.UnfinishedJobs()) != captures {
+		t.Fatalf("recovered jobs = %d", len(s.UnfinishedJobs()))
+	}
+	request, _, ok, err := s.Load("request-100")
+	if err != nil || !ok || string(request.Body) != "body-100" {
+		t.Fatalf("recovered payload = %#v %v %v", request, ok, err)
+	}
+	request = validRequest("request-101", "delivery-101", "body-101", now.Add(captures*time.Second))
+	job := Job{ID: "job-101", RequestID: request.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: request.ReceivedAt}
+	if _, result, _, err := s.Accept(request, &job); err != nil || result != Captured {
+		t.Fatalf("post-recovery capture = %v %v", result, err)
+	}
+	// Recovered snapshot records do not count as mutations. The first append
+	// after reopening must not immediately rewrite the 202-record snapshot.
+	if got := s.Sequence(); got != 304 {
+		t.Fatalf("post-recovery append sequence = %d, want 304", got)
+	}
+}
+
+func TestPayloadBodiesAreLoadedFromRecordOffsets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.ndjson")
+	s, err := OpenWithOptions(path, Options{MaxEvents: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	request := validRequest("request-1", "delivery-1", "request payload", now)
+	job := Job{ID: "job-1", RequestID: request.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: now}
+	if _, _, _, err := s.Accept(request, &job); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := s.ClaimNextJob("worker", now, time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claim = %#v %v %v", claimed, ok, err)
+	}
+	attempt := Attempt{ID: "attempt-1", JobID: job.ID, RequestID: request.ID, Number: 1, StartedAt: now, FinishedAt: now.Add(time.Second), ResponseBody: []byte("response payload")}
+	if err := s.RecordAttempt(job.ID, "worker", attempt, "succeeded", "", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	s.mu.RLock()
+	residentRequestBytes := len(s.requests[request.ID].Body)
+	residentAttemptBytes := len(s.attempts[request.ID][0].ResponseBody)
+	s.mu.RUnlock()
+	if residentRequestBytes != 0 || residentAttemptBytes != 0 {
+		t.Fatalf("resident payload bytes = request %d, attempt %d", residentRequestBytes, residentAttemptBytes)
+	}
+	loaded, attempts, ok, err := s.Load(request.ID)
+	if err != nil || !ok || string(loaded.Body) != "request payload" || len(attempts) != 1 || string(attempts[0].ResponseBody) != "response payload" {
+		t.Fatalf("loaded = %#v, attempts = %#v, ok = %v, err = %v", loaded, attempts, ok, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = OpenWithOptions(path, Options{MaxEvents: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	loaded, attempts, ok, err = s.Load(request.ID)
+	if err != nil || !ok || string(loaded.Body) != "request payload" || len(attempts) != 1 || string(attempts[0].ResponseBody) != "response payload" {
+		t.Fatalf("recovered load = %#v, attempts = %#v, ok = %v, err = %v", loaded, attempts, ok, err)
+	}
+}
+
+func TestRedactHeadersRecountsAndTrimsCatchUpRing(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "store.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	request := validRequest("request-1", "delivery-1", "body", time.Now().UTC())
+	request.Headers = Header{"X-ApiKey": {"x"}}
+	if _, result, err := s.Capture(request); err != nil || result != Captured {
+		t.Fatalf("capture = %v %v", result, err)
+	}
+
+	s.mu.Lock()
+	if len(s.ring) != 1 {
+		t.Fatalf("initial ring length = %d", len(s.ring))
+	}
+	s.opts.MaxCatchUpBytes = s.ringBytes + 1
+	s.mu.Unlock()
+	if err := s.RedactHeaders(func(name string) bool { return strings.EqualFold(name, "X-ApiKey") }); err != nil {
+		t.Fatal(err)
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.ring) != 0 || s.ringBytes != 0 {
+		t.Fatalf("redacted ring length/bytes = %d/%d, want 0/0", len(s.ring), s.ringBytes)
+	}
+}
+
+func TestRedactHeadersPurgesHistoricalLogWithEmptyCurrentState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.ndjson")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	const canary = "historical-only-secret"
+	request := validRequest("request-1", "delivery-1", "body", time.Now().UTC())
+	request.Headers = Header{"X-ApiKey": {canary}}
+	if _, result, err := s.Capture(request); err != nil || result != Captured {
+		t.Fatalf("capture = %v %v", result, err)
+	}
+	wantSequence := s.Sequence()
+
+	// Model an entirely evicted current state whose old event has also aged out
+	// of the catch-up ring. RedactHeaders must still purge the active log based
+	// on its complete-file scan.
+	s.mu.Lock()
+	s.removeRequest(request.ID)
+	s.ring = nil
+	s.ringBytes = 0
+	s.mu.Unlock()
+	if err := s.RedactHeaders(func(name string) bool { return strings.EqualFold(name, "X-ApiKey") }); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contents) != 0 || bytes.Contains(contents, []byte(canary)) {
+		t.Fatalf("empty-state compacted log = %q", contents)
+	}
+	if got := s.Sequence(); got != wantSequence {
+		t.Fatalf("sequence after empty compaction = %d, want %d", got, wantSequence)
+	}
+}
+
+func TestConcurrentLoadsAndCompaction(t *testing.T) {
+	s, err := OpenWithOptions(filepath.Join(t.TempDir(), "store.ndjson"), Options{MaxCaptures: 100, MaxEvents: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	anchor := validRequest("anchor", "anchor-delivery", strings.Repeat("payload", 1024), now)
+	anchorJob := Job{ID: "anchor-job", RequestID: anchor.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: now}
+	if _, _, _, err := s.Accept(anchor, &anchorJob); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan error, 4)
+	var readers sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			<-start
+			for j := 0; j < 50; j++ {
+				loaded, _, ok, err := s.Load(anchor.ID)
+				if err != nil || !ok || !bytes.Equal(loaded.Body, anchor.Body) {
+					errCh <- fmt.Errorf("load %d: ok=%v err=%v bytes=%d", j, ok, err, len(loaded.Body))
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	for i := 0; i < 30; i++ {
+		request := validRequest(fmt.Sprintf("request-%d", i), fmt.Sprintf("delivery-%d", i), fmt.Sprintf("body-%d", i), now.Add(time.Duration(i+1)*time.Second))
+		if _, _, err := s.Capture(request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readers.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
 	}
 }
 

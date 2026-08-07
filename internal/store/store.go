@@ -999,8 +999,31 @@ func (s *Store) compactLocked() error {
 		os.Remove(tmpName)
 		return err
 	}
+	old := s.f
+	oldClosed := false
+	if runtime.GOOS == "windows" {
+		// MoveFileEx cannot replace an existing destination while Relaybox's
+		// own destination handle remains open. The record and replacement are
+		// both synced by this point, so close only for the atomic path swap.
+		if err := old.Close(); err != nil {
+			os.Remove(tmpName)
+			return err
+		}
+		oldClosed = true
+	}
 	if err := os.Rename(tmpName, s.path); err != nil {
 		os.Remove(tmpName)
+		if oldClosed {
+			reopened, reopenErr := openStoreFile(s.path, false)
+			if reopenErr != nil {
+				return errors.Join(err, fmt.Errorf("reopen store after failed compaction: %w", reopenErr))
+			}
+			if _, seekErr := reopened.Seek(0, io.SeekEnd); seekErr != nil {
+				reopened.Close()
+				return errors.Join(err, fmt.Errorf("seek reopened store after failed compaction: %w", seekErr))
+			}
+			s.f = reopened
+		}
 		return err
 	}
 	if err := syncDirectory(dir); err != nil {
@@ -1014,9 +1037,11 @@ func (s *Store) compactLocked() error {
 		newFile.Close()
 		return err
 	}
-	old := s.f
 	s.f = newFile
 	s.eventCount = len(records)
+	if oldClosed {
+		return nil
+	}
 	return old.Close()
 }
 

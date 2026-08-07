@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -35,11 +36,30 @@ func main() {
 	case "healthcheck":
 		healthcheck(os.Args[2:])
 	case "version":
-		fmt.Println("relaybox", version)
+		fmt.Println("relaybox", resolvedVersion())
 	default:
 		usage()
 		os.Exit(2)
 	}
+}
+
+func resolvedVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	return resolveVersion(version, info, ok)
+}
+
+func resolveVersion(injected string, info *debug.BuildInfo, ok bool) string {
+	if injected = strings.TrimPrefix(strings.TrimSpace(injected), "v"); injected != "" && injected != "dev" {
+		return injected
+	}
+	if !ok || info == nil {
+		return "dev"
+	}
+	built := strings.TrimPrefix(strings.TrimSpace(info.Main.Version), "v")
+	if built == "" || built == "(devel)" {
+		return "dev"
+	}
+	return built
 }
 
 func usage() {

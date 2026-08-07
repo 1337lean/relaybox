@@ -114,6 +114,9 @@ func New(c Config) *App {
 	}
 	a.accepting.Store(true)
 	a.routes()
+	if err := c.Store.RedactHeaders(func(name string) bool { return sensitiveHeader(name, a.sensitive) }); err != nil {
+		c.Logger.Error("migrate legacy sensitive headers", "error", err)
+	}
 	if err := c.Store.RecoverLeases(time.Now().UTC()); err != nil {
 		c.Logger.Error("recover forwarding leases", "error", err)
 	}
@@ -415,7 +418,7 @@ func sensitiveHeaderPolicy(extra []string) map[string]struct{} {
 func redactWithPolicy(h http.Header, policy map[string]struct{}) store.Header {
 	out := store.Header{}
 	for k, v := range h {
-		if _, sensitive := policy[strings.ToLower(k)]; sensitive {
+		if sensitiveHeader(k, policy) {
 			out[k] = []string{"[REDACTED]"}
 		} else {
 			out[k] = append([]string(nil), v...)
@@ -424,8 +427,74 @@ func redactWithPolicy(h http.Header, policy map[string]struct{}) store.Header {
 	return out
 }
 
+func sensitiveHeader(name string, policy map[string]struct{}) bool {
+	lowerName := strings.ToLower(strings.TrimSpace(name))
+	if _, configured := policy[lowerName]; configured {
+		return true
+	}
+
+	// Header ecosystems spell the same credential concepts in many forms
+	// (X-API-Key, X-ApiKey, Api_Key, X-Auth, Authentication, and so on).
+	// Normalize punctuation for compound markers, while recognizing a bare
+	// "auth" only as a delimited component to avoid matching unrelated names
+	// such as X-Author.
+	var normalized strings.Builder
+	componentStart := 0
+	components := make([]string, 0, 4)
+	for i, r := range lowerName {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			normalized.WriteRune(r)
+			continue
+		}
+		if componentStart < i {
+			components = append(components, lowerName[componentStart:i])
+		}
+		componentStart = i + 1
+	}
+	if componentStart < len(lowerName) {
+		components = append(components, lowerName[componentStart:])
+	}
+	for _, component := range components {
+		if component == "auth" {
+			return true
+		}
+	}
+	compact := normalized.String()
+	for _, marker := range []string{
+		"apikey", "authorization", "authentication", "credential",
+		"cookie", "secret", "signature", "token",
+	} {
+		if strings.Contains(compact, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) redact(h http.Header) store.Header {
 	return redactWithPolicy(h, a.sensitive)
+}
+
+func (a *App) sanitizeRequest(request store.Request) store.Request {
+	request.Headers = redactWithPolicy(http.Header(request.Headers), a.sensitive)
+	return request
+}
+
+func (a *App) sanitizeAttempt(attempt store.Attempt) store.Attempt {
+	attempt.ResponseHeaders = redactWithPolicy(http.Header(attempt.ResponseHeaders), a.sensitive)
+	return attempt
+}
+
+func (a *App) sanitizeEvent(event store.Event) store.Event {
+	if event.Request != nil {
+		request := a.sanitizeRequest(*event.Request)
+		event.Request = &request
+	}
+	if event.Attempt != nil {
+		attempt := a.sanitizeAttempt(*event.Attempt)
+		event.Attempt = &attempt
+	}
+	return event
 }
 func newID() (string, error) {
 	b := make([]byte, 16)
@@ -464,15 +533,27 @@ func parseBounded(s string, def, min, max int) int {
 	return n
 }
 func (a *App) get(w http.ResponseWriter, r *http.Request) {
-	req, at, ok := a.c.Store.Get(r.PathValue("id"))
+	req, at, ok, err := a.c.Store.Load(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "storage failure", http.StatusInternalServerError)
+		return
+	}
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
+	req = a.sanitizeRequest(req)
+	for i := range at {
+		at[i] = a.sanitizeAttempt(at[i])
+	}
 	jsonOut(w, 200, map[string]any{"request": req, "attempts": at})
 }
 func (a *App) replay(w http.ResponseWriter, r *http.Request) {
-	req, _, ok := a.c.Store.Get(r.PathValue("id"))
+	req, _, ok, err := a.c.Store.Load(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "storage failure", http.StatusInternalServerError)
+		return
+	}
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -565,7 +646,11 @@ func (a *App) worker(owner string) {
 	}
 }
 func (a *App) forward(owner string, j store.Job) {
-	req, _, ok := a.c.Store.Get(j.RequestID)
+	req, _, ok, loadErr := a.c.Store.Load(j.RequestID)
+	if loadErr != nil {
+		a.c.Logger.Error("load forwarding request", "error", loadErr, "job", j.ID)
+		return
+	}
 	if !ok {
 		if err := a.c.Store.FinishWithoutAttempt(j.ID, owner, "poison", "request missing"); err != nil {
 			a.c.Logger.Error("persist poison job", "error", err, "job", j.ID)
@@ -583,7 +668,7 @@ func (a *App) forward(owner string, j store.Job) {
 	started := time.Now().UTC()
 	hr, requestErr := http.NewRequestWithContext(a.ctx, http.MethodPost, j.URL, bytes.NewReader(req.Body))
 	if requestErr == nil {
-		hr.Header = forwardHeaders(req.Headers)
+		hr.Header = forwardHeaders(req.Headers, a.sensitive)
 		if a.c.ForwardAuthorization != "" {
 			hr.Header.Set("Authorization", a.c.ForwardAuthorization)
 		}
@@ -641,7 +726,7 @@ func (a *App) forward(owner string, j store.Job) {
 	}
 }
 
-func forwardHeaders(src store.Header) http.Header {
+func forwardHeaders(src store.Header, sensitive map[string]struct{}) http.Header {
 	drop := map[string]struct{}{
 		"Connection":            {},
 		"Keep-Alive":            {},
@@ -670,6 +755,9 @@ func forwardHeaders(src store.Header) http.Header {
 
 	dst := make(http.Header)
 	for name, values := range src {
+		if sensitiveHeader(name, sensitive) {
+			continue
+		}
 		name = http.CanonicalHeaderKey(name)
 		if _, blocked := drop[name]; blocked || name == "" {
 			continue
@@ -760,6 +848,7 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 		return controller.Flush() == nil
 	}
 	send := func(e store.Event) bool {
+		e = a.sanitizeEvent(e)
 		b, err := json.Marshal(e)
 		if err != nil {
 			return false

@@ -36,6 +36,7 @@ type Event struct {
 	Seq               uint64    `json:"seq"`
 	Kind              string    `json:"kind"`
 	At                time.Time `json:"at"`
+	Snapshot          bool      `json:"snapshot,omitempty"`
 	Request           *Request  `json:"request,omitempty"`
 	Attempt           *Attempt  `json:"attempt,omitempty"`
 	Job               *Job      `json:"job,omitempty"`

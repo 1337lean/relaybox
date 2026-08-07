@@ -12,6 +12,7 @@ archives:
     files:
       - LICENSE
       - README.md
+      - THIRD_PARTY_NOTICES.md
     format_overrides:
       - goos: windows
         formats: [zip]

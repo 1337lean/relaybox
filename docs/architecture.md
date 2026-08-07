@@ -4,7 +4,7 @@ Relaybox is one Go process. `cmd/relaybox` owns configuration and bounded shutdo
 
 ## Storage and acknowledgement
 
-Every newline is one complete JSON event with a monotonic sequence. Appends are serialized, fully written, synced, indexed, and then published to live subscribers. A write or sync failure poisons readiness and prevents later appends. Startup truncates only an incomplete final record and rejects malformed JSON, sequence gaps, unknown event kinds, invalid event shapes, and request-body digest mismatches.
+Every newline is one complete JSON event with a monotonic sequence. Appends are serialized, fully written, synced, indexed, and then published to live subscribers. A write or sync failure poisons readiness and prevents later appends. Startup truncates only an incomplete final record and rejects malformed JSON, sequence gaps, unknown event kinds, invalid event shapes, and request-body digest mismatches. Recovery retains request/job/attempt metadata and record offsets in memory; request and response bodies are loaded from the already-open log only for detail, replay, or forwarding operations.
 
 When forwarding is configured, `capture.accepted` contains both the request and its initial `pending` forwarding job. Deduplication is checked and that combined event is written and synced under one store lock. Relaybox returns `202 Accepted` only after this single durable commit. When forwarding is disabled, the same event contains only the request. A duplicate returns the existing request and leaves its original job discoverable; it never creates a second initial intent.
 
@@ -30,17 +30,17 @@ Delivery is at least once. Interruption after the destination processes a reques
 
 ## Redaction and outbound headers
 
-Relaybox applies a case-insensitive sensitive-header policy before persistence. The defaults cover authorization, proxy authorization, cookies, common API key/token/secret names, AWS security tokens, and GitHub signature headers. `RELAYBOX_SENSITIVE_HEADERS` adds organization-specific names. Persisted records, APIs, SSE, search, metrics, logs, and ordinary forwarding therefore never receive the original values.
+Relaybox applies a case-insensitive sensitive-header policy before persistence. The defaults cover authorization, proxy authorization, cookies, common API key/token/secret names, AWS security tokens, and GitHub signature headers. `RELAYBOX_SENSITIVE_HEADERS` adds organization-specific names. Startup migrates matching headers retained by older stores into a compacted redacted snapshot, while detail, SSE, replay, and forwarding apply the same policy again at read boundaries. New persisted records, APIs, SSE, search, metrics, logs, and ordinary forwarding therefore never receive the original values.
 
 Forwarding removes every redacted and hop-by-hop header. If the destination needs authentication, `RELAYBOX_FORWARD_AUTHORIZATION` injects a separate `Authorization` value at send time; that value is never stored as capture data.
 
 ## Search, SSE, and retention
 
-Each capture has a normalized search index containing identifiers, path, and at most `-search-bytes` body bytes. A list request copies bounded summaries and index references under `RLock`, then matches, sorts, and paginates outside the lock with request cancellation and a two-second handler budget. Responses include `truncated` if the configured scan limit prevented a complete scan.
+Each capture has a normalized search index containing identifiers, path, and at most `-search-bytes` body bytes. A list request copies bounded summaries and index references under `RLock`, then matches, sorts, and paginates outside the lock with request cancellation and a two-second handler budget. Responses include `truncated` if the configured scan limit prevented a complete scan. Detail payload reads use positional I/O against the stable open descriptor and do not hold the state lock, so ordinary appends can continue concurrently.
 
 SSE catch-up reads an in-memory sequence ring instead of scanning the event log. The ring defaults to 1,000 events and 32 MiB. A cursor older than the ring receives `409 Conflict`; live subscribers have a bounded buffer and are disconnected on overflow. Network writes have deadlines, and clients reconnect from their last delivered sequence.
 
-The default policy retains 1,000 captures, eight jobs per capture, ten attempts per job, and a 64 KiB body-search prefix. Completed oldest data is evicted by identifiers recorded in the next durable event. Unfinished work is never selected for eviction. When the event-count threshold is crossed, the store writes retained state to a synced temporary file, atomically replaces the log, syncs the directory, and continues the global sequence. Recovery accepts a compacted log whose first retained sequence is greater than one.
+The default policy retains 1,000 captures, eight jobs per capture, ten attempts per job, and a 64 KiB body-search prefix. Completed oldest data is evicted by identifiers recorded in the next durable event. Unfinished work is never selected for eviction. When the event-count threshold is crossed, the store streams retained payloads one record at a time into a synced temporary file, atomically replaces the log, syncs the directory, and assigns the snapshot fresh sequence values after the last event. This matters because one atomic capture event can expand into separate request and current-job snapshot records. Recovery accepts both legacy events and a compacted log whose first retained sequence is greater than one.
 
 ## Outbound network boundary
 

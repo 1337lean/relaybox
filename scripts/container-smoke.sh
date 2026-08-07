@@ -22,6 +22,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 test "$(docker image inspect "$image" --format '{{.Config.User}}')" = "65532:65532"
+test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = "https://github.com/1337lean/relaybox"
+test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}')" = "MIT"
+test -n "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.description"}}')"
 docker build --quiet --target receiver --tag "$receiver_image" . >/dev/null
 docker network create "$network" >/dev/null
 docker volume create "$volume" >/dev/null
@@ -104,6 +107,8 @@ printf '%s' "$metrics" | grep -q '"succeeded":1'
 
 docker export "$container" >"$work_dir/rootfs.tar"
 tar -tf "$work_dir/rootfs.tar" | grep -q '^etc/ssl/certs/ca-certificates.crt$'
+tar -tf "$work_dir/rootfs.tar" | grep -q '^LICENSE$'
+tar -tf "$work_dir/rootfs.tar" | grep -q '^THIRD_PARTY_NOTICES.md$'
 
 docker stop --time 25 "$container" >/dev/null
 test "$(docker inspect "$container" --format '{{.State.ExitCode}}')" = 0

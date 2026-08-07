@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible Relaybox defect
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include secrets, webhook payloads, operator tokens, or undisclosed security vulnerabilities. Use the private security reporting link for security issues.
+  - type: input
+    id: version
+    attributes:
+      label: Relaybox version
+      description: Paste `relaybox version`, a release tag, or a commit SHA.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation
+      options:
+        - Release archive
+        - Go install or source build
+        - Container image
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Operating system, architecture, and container runtime if applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Provide the smallest safe sequence that reproduces the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include sanitized logs or error output where useful.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, tokens, signatures, private payloads, and other sensitive data.
+          required: true
+        - label: This is not an undisclosed security vulnerability.
+          required: true

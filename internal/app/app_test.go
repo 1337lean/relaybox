@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -269,7 +270,7 @@ func TestForwardHeadersDropSpoofingAndHopByHopValues(t *testing.T) {
 		"X-Relaybox-Request-ID": {"spoofed"},
 		"X-Remove":              {"remove me"},
 		"X-Safe":                {"keep me"},
-	})
+	}, sensitiveHeaderPolicy(nil))
 
 	for _, name := range []string{
 		"Connection",
@@ -600,22 +601,199 @@ func TestSensitiveHeadersAreRemovedAcrossDataPaths(t *testing.T) {
 	}
 }
 
+func TestLegacyLogSensitiveHeadersAreMigratedAndSanitizedAtEveryEgress(t *testing.T) {
+	const (
+		apiSecret      = "legacy-api-secret"
+		authSecret     = "legacy-authentication-secret"
+		credential     = "legacy-credential-secret"
+		orgSecret      = "legacy-organization-secret"
+		responseSecret = "legacy-response-secret"
+	)
+	forwarded := make(chan http.Header, 1)
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer destination.Close()
+
+	path := filepath.Join(t.TempDir(), "legacy.ndjson")
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("safe legacy body")
+	digest := sha256.Sum256(body)
+	now := time.Now().UTC()
+	request := store.Request{
+		ID: "legacy-request", DeliveryID: "legacy-delivery", Method: http.MethodPost, Path: "/inbox",
+		BodySHA256: hex.EncodeToString(digest[:]), Body: body, ReceivedAt: now,
+		Headers: store.Header{
+			"X-ApiKey":                  {apiSecret},
+			"Authentication":            {authSecret},
+			"X-Credential-ID":           {credential},
+			"X-Organization-Credential": {orgSecret},
+			"X-Safe":                    {"keep me"},
+		},
+	}
+	if _, err := s.Append(store.Event{Kind: "request.received", At: now, Request: &request}); err != nil {
+		t.Fatal(err)
+	}
+	completedJob := store.Job{ID: "legacy-completed", RequestID: request.ID, URL: destination.URL, State: "pending", CreatedAt: now}
+	if err := s.Enqueue(completedJob); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.ClaimNextJob("legacy-worker", now, time.Minute); err != nil || !ok {
+		t.Fatalf("claim legacy job = %v %v", ok, err)
+	}
+	legacyAttempt := store.Attempt{
+		ID: "legacy-attempt", JobID: completedJob.ID, RequestID: request.ID, URL: destination.URL,
+		Number: 1, Status: http.StatusNoContent, StartedAt: now, FinishedAt: now.Add(time.Second),
+		ResponseHeaders: store.Header{"X-ApiKey": {responseSecret}},
+	}
+	if err := s.RecordAttempt(completedJob.ID, "legacy-worker", legacyAttempt, "succeeded", "", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	pendingJob := store.Job{ID: "legacy-pending", RequestID: request.ID, URL: destination.URL, State: "pending", CreatedAt: now.Add(2 * time.Second)}
+	if err := s.Enqueue(pendingJob); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := New(Config{
+		Store: s, OperatorToken: "operator", AllowPrivateTargets: true,
+		SensitiveHeaders: []string{"X-Organization-Credential"}, PollInterval: 5 * time.Millisecond,
+	})
+	defer stopApp(t, a, s)
+
+	sseContext, cancelSSE := context.WithCancel(context.Background())
+	cancelSSE()
+	sseRequest := httptest.NewRequest(http.MethodGet, "/api/events?cursor=0", nil).WithContext(sseContext)
+	sseRequest.Header.Set("Authorization", "Bearer operator")
+	sseResponse := httptest.NewRecorder()
+	a.Handler().ServeHTTP(sseResponse, sseRequest)
+	if sseResponse.Code != http.StatusOK {
+		t.Fatalf("SSE response = %d: %s", sseResponse.Code, sseResponse.Body.String())
+	}
+
+	a.Wait()
+	outbound := <-forwarded
+	for _, name := range []string{"X-ApiKey", "Authentication", "X-Credential-ID", "X-Organization-Credential"} {
+		if value := outbound.Get(name); value != "" {
+			t.Errorf("legacy %s forwarded as %q", name, value)
+		}
+	}
+	if value := outbound.Get("X-Safe"); value != "keep me" {
+		t.Fatalf("safe legacy header = %q", value)
+	}
+
+	detailRequest := httptest.NewRequest(http.MethodGet, "/api/requests/"+request.ID, nil)
+	detailRequest.Header.Set("Authorization", "Bearer operator")
+	detailResponse := httptest.NewRecorder()
+	a.Handler().ServeHTTP(detailResponse, detailRequest)
+	if detailResponse.Code != http.StatusOK {
+		t.Fatalf("detail response = %d: %s", detailResponse.Code, detailResponse.Body.String())
+	}
+
+	disk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputs := [][]byte{sseResponse.Body.Bytes(), detailResponse.Body.Bytes(), disk}
+	for _, secret := range []string{apiSecret, authSecret, credential, orgSecret, responseSecret} {
+		for _, output := range outputs {
+			if bytes.Contains(output, []byte(secret)) {
+				t.Fatalf("legacy egress or migrated store leaked %q", secret)
+			}
+		}
+	}
+	if !bytes.Contains(sseResponse.Body.Bytes(), []byte("[REDACTED]")) || !bytes.Contains(detailResponse.Body.Bytes(), []byte("[REDACTED]")) {
+		t.Fatal("legacy presentation paths did not contain redaction markers")
+	}
+}
+
+func TestLegacyHeaderMigrationPurgesEvictedHistoryOutsideCatchUpRing(t *testing.T) {
+	const canary = "evicted-legacy-header-secret"
+	path := filepath.Join(t.TempDir(), "evicted-legacy.ndjson")
+	options := store.Options{MaxCaptures: 2, MaxCatchUpEvents: 1}
+	s, err := store.OpenWithOptions(path, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		body := []byte(fmt.Sprintf("body-%d", i))
+		digest := sha256.Sum256(body)
+		headers := store.Header{"X-Safe": {"safe"}}
+		if i == 0 {
+			headers = store.Header{"X-ApiKey": {canary}}
+		}
+		request := store.Request{
+			ID: fmt.Sprintf("request-%d", i), DeliveryID: fmt.Sprintf("delivery-%d", i),
+			BodySHA256: hex.EncodeToString(digest[:]), Body: body, ReceivedAt: now.Add(time.Duration(i) * time.Second), Headers: headers,
+		}
+		if _, result, err := s.Capture(request); err != nil || result != store.Captured {
+			t.Fatalf("capture %d = %v %v", i, result, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(before, []byte(canary)) {
+		t.Fatal("test fixture did not retain the evicted legacy secret")
+	}
+
+	s, err = store.OpenWithOptions(path, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := New(Config{Store: s, OperatorToken: "operator"})
+	defer stopApp(t, a, s)
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(after, []byte(canary)) {
+		t.Fatal("evicted legacy secret remained in the active append log after migration")
+	}
+}
+
 func TestRedactionPolicyIsCaseInsensitiveAndExtensible(t *testing.T) {
 	policy := sensitiveHeaderPolicy([]string{"X-Organization-Key"})
 	headers := http.Header{
 		"x-api-key":          {"api-secret"},
+		"X-ApiKey":           {"api-secret-compact"},
+		"Api_Key":            {"api-secret-underscore"},
 		"X-AUTH-TOKEN":       {"token-secret"},
+		"Authentication":     {"authentication-secret"},
+		"X-Auth":             {"auth-secret"},
+		"X-Credential-ID":    {"credential-secret"},
 		"x-organization-key": {"org-secret"},
+		"X-Author":           {"not-an-auth-header"},
 		"X-Safe":             {"safe"},
 	}
 	redacted := redactWithPolicy(headers, policy)
-	for _, name := range []string{"x-api-key", "X-AUTH-TOKEN", "x-organization-key"} {
+	for _, name := range []string{
+		"x-api-key", "X-ApiKey", "Api_Key", "X-AUTH-TOKEN",
+		"Authentication", "X-Auth", "X-Credential-ID", "x-organization-key",
+	} {
 		if got := redacted[name]; len(got) != 1 || got[0] != "[REDACTED]" {
 			t.Errorf("%s = %#v", name, got)
 		}
 	}
-	if got := redacted["X-Safe"]; len(got) != 1 || got[0] != "safe" {
-		t.Fatalf("safe header = %#v", got)
+	for name, want := range map[string]string{"X-Author": "not-an-auth-header", "X-Safe": "safe"} {
+		if got := redacted[name]; len(got) != 1 || got[0] != want {
+			t.Errorf("non-sensitive %s = %#v", name, got)
+		}
 	}
 }
 

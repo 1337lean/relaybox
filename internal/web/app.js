@@ -67,12 +67,17 @@ function startEventStream() {
   state.events = new EventSource("/api/events");
 
   const eventNames = [
+    "capture.accepted",
     "request.received",
     "attempt.finished",
+    "forward.pending",
     "forward.queued",
+    "forward.leased",
+    "forward.retrying",
     "forward.succeeded",
     "forward.failed",
     "forward.fatal",
+    "forward.dead-letter",
     "forward.poison",
   ];
   for (const name of eventNames) {

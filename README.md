@@ -24,20 +24,25 @@ go run ./cmd/relaybox serve -operator-token dev-token -forward http://127.0.0.1:
 
 ## Commands and API
 
-`serve` supports `-addr`, `-data`, `-secret`, `-operator-token`, `-forward`, `-allow-private-targets`, `-secure-cookie`, `-max-body`, `-max-inflight`, `-attempts`, `-concurrency`, and `-queue-size`. Use `-secure-cookie` when TLS terminates at a reverse proxy. Size and concurrency settings have defensive upper bounds. `healthcheck` checks readiness; `demo` sends a sample event; `version` reports the build version.
+`serve` supports `-addr`, `-data`, `-secret`, `-operator-token`, `-forward`, `-allow-private-targets`, `-secure-cookie`, `-max-body`, `-max-inflight`, `-attempts`, `-concurrency`, `-queue-size`, `-retention-captures`, `-retention-events`, `-jobs-per-request`, and `-search-bytes`. Use `-secure-cookie` when TLS terminates at a reverse proxy. Size, concurrency, search, and retention settings have defensive upper bounds. `healthcheck` checks readiness; `demo` sends a sample event; `version` reports the build version.
 
 - `POST /inbox[/anything]`: capture, intentionally usable without the operator token.
-- `GET /api/requests?q=&offset=&limit=`: authenticated paginated summaries (no bodies).
+- `GET /api/requests?q=&offset=&limit=`: authenticated, bounded paginated search summaries (no bodies).
 - `GET /api/requests/{id}`: authenticated detail.
 - `POST /api/requests/{id}/replay`: authenticated replay to the configured target only.
 - `GET /api/events`: authenticated SSE, with bounded `Last-Event-ID` resume support.
+- `GET /api/metrics`: authenticated bounded forwarding-state counts.
 - `GET /healthz`, `GET /readyz`: liveness and storage/readiness probes.
 
 Bearer clients send `Authorization: Bearer TOKEN`. The UI exchanges the token for a domain-separated, derived session value in an HttpOnly, Strict SameSite operator cookie; state-changing cookie-authenticated requests require an exact same-origin `Origin` header.
 
 ## Durability and delivery
 
-The append-only NDJSON log is fsynced for every event. Capture and delivery-ID deduplication occur under one store lock; reuse of a delivery ID with a different body returns `409 Conflict`. Forward intent is persisted before `202 Accepted`. Fixed workers consume a bounded queue, and queued/running jobs are resumed after restart. Delivery is at least once: a crash around an outbound request can repeat it. Attempts and terminal failure/poison states are persisted.
+The append-only NDJSON log is synced for every event. Capture, deduplication, and the required forwarding intent are one durable record before `202 Accepted`; reuse of a delivery ID with a different body returns `409 Conflict`. Fixed workers lease and poll durable jobs, while the bounded in-memory channel is only a wake-up hint. Pending, retrying, expired, and prior-process leased jobs are recovered without depending on request re-enqueueing. Attempts and their resulting states are atomic. Delivery is at least once: a crash around an outbound request can repeat it.
+
+Retention defaults to 1,000 captures and eight jobs per capture. Completed oldest data is evicted durably; unfinished forwarding is never evicted, and a full store returns `507 Insufficient Storage`. Search uses a bounded body-prefix index outside the store lock. SSE resumes from a bounded sequence ring rather than scanning the log.
+
+Sensitive headers, including API keys, are redacted before persistence and removed from forwarding. Add organization-specific names with `RELAYBOX_SENSITIVE_HEADERS`. If a destination needs authentication, set `RELAYBOX_FORWARD_AUTHORIZATION`; it is injected at send time and is not stored with captures.
 
 Redirects and outbound environment proxies are disabled. Targets must be configured by the operator; replay cannot supply a URL. Public destinations are allowed by default, while loopback, private, link-local, multicast, and unspecified addresses are blocked at dial time (including DNS results). Hop-by-hop headers and spoofable forwarding/Relaybox identity headers are removed before delivery. `-allow-private-targets` disables the IP protection and is for controlled development only.
 

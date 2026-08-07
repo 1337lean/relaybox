@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -84,13 +86,15 @@ func TestRecoveryRejectsSequenceGaps(t *testing.T) {
 func TestConcurrentCaptureIsAtomic(t *testing.T) {
 	s, _ := Open(filepath.Join(t.TempDir(), "s"))
 	defer s.Close()
+	body := []byte("body")
+	sum := sha256.Sum256(body)
 	var wg sync.WaitGroup
 	counts := make(chan CaptureResult, 64)
 	for i := 0; i < 64; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, r, e := s.Capture(Request{ID: time.Now().String(), DeliveryID: "same", BodySHA256: "hash"})
+			_, r, e := s.Capture(Request{ID: time.Now().String(), DeliveryID: "same", BodySHA256: hex.EncodeToString(sum[:]), Body: body})
 			if e != nil {
 				t.Error(e)
 			}
@@ -112,10 +116,17 @@ func TestConcurrentCaptureIsAtomic(t *testing.T) {
 func TestAttemptImmutable(t *testing.T) {
 	s, _ := Open(filepath.Join(t.TempDir(), "s"))
 	defer s.Close()
-	r := Request{ID: "r"}
-	s.Capture(r)
-	a := Attempt{ID: "a", RequestID: "r", Status: 200, ResponseBody: []byte("ok")}
-	s.Append(Event{Kind: "attempt.finished", Attempt: &a})
+	body := []byte("body")
+	sum := sha256.Sum256(body)
+	r := Request{ID: "r", BodySHA256: hex.EncodeToString(sum[:]), Body: body}
+	j := Job{ID: "j", RequestID: r.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: time.Now().UTC()}
+	if _, _, _, err := s.Accept(r, &j); err != nil {
+		t.Fatal(err)
+	}
+	a := Attempt{ID: "a", JobID: "j", RequestID: "r", Number: 1, Status: 200, ResponseBody: []byte("ok")}
+	if _, err := s.Append(Event{Kind: "attempt.finished", Attempt: &a}); err != nil {
+		t.Fatal(err)
+	}
 	a.Status = 500
 	a.ResponseBody[0] = 'x'
 	_, got, _ := s.Get("r")
@@ -126,7 +137,9 @@ func TestAttemptImmutable(t *testing.T) {
 func TestSubscriptionSnapshot(t *testing.T) {
 	s, _ := Open(filepath.Join(t.TempDir(), "s"))
 	defer s.Close()
-	r := Request{ID: "1", BodySHA256: "a"}
+	body := []byte("a")
+	sum := sha256.Sum256(body)
+	r := Request{ID: "1", BodySHA256: hex.EncodeToString(sum[:]), Body: body}
 	s.Capture(r)
 	old, ch, cancel, e := s.SubscribeFrom(0)
 	if e != nil {
@@ -137,7 +150,9 @@ func TestSubscriptionSnapshot(t *testing.T) {
 		t.Fatalf("old %d", len(old))
 	}
 	r.ID = "2"
-	r.BodySHA256 = "b"
+	r.Body = []byte("b")
+	sum = sha256.Sum256(r.Body)
+	r.BodySHA256 = hex.EncodeToString(sum[:])
 	s.Capture(r)
 	select {
 	case e := <-ch:
@@ -222,4 +237,357 @@ func FuzzRecovery(f *testing.F) {
 			s.Close()
 		}
 	})
+}
+
+func validRequest(id, deliveryID, body string, receivedAt time.Time) Request {
+	payload := []byte(body)
+	sum := sha256.Sum256(payload)
+	return Request{ID: id, DeliveryID: deliveryID, BodySHA256: hex.EncodeToString(sum[:]), Body: payload, ReceivedAt: receivedAt}
+}
+
+func TestAcceptPersistsCaptureAndIntentInOneRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.ndjson")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	r := validRequest("request-1", "delivery-1", "body", now)
+	j := Job{ID: "job-1", RequestID: r.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: now}
+	id, result, persisted, err := s.Accept(r, &j)
+	if err != nil || result != Captured || id != r.ID || persisted == nil || persisted.ID != j.ID {
+		t.Fatalf("accept = %q %v %#v %v", id, result, persisted, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := bytes.Count(contents, []byte{'\n'}); lines != 1 {
+		t.Fatalf("capture and intent used %d records", lines)
+	}
+	var event Event
+	if err := json.Unmarshal(bytes.TrimSpace(contents), &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Kind != "capture.accepted" || event.Request == nil || event.Job == nil {
+		t.Fatalf("atomic event = %#v", event)
+	}
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, _, ok := s.Get(r.ID); !ok || s.JobCounts()["pending"] != 1 {
+		t.Fatalf("recovered request/job = %v %#v", ok, s.JobCounts())
+	}
+}
+
+func TestDuplicateKeepsOriginalIntentDiscoverable(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "store.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	r := validRequest("request-1", "delivery-1", "body", now)
+	j := Job{ID: "job-1", RequestID: r.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: now}
+	if _, _, _, err := s.Accept(r, &j); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := r
+	duplicate.ID = "request-2"
+	newJob := Job{ID: "job-2", RequestID: duplicate.ID, URL: j.URL, State: "pending", CreatedAt: now.Add(time.Second)}
+	id, result, existing, err := s.Accept(duplicate, &newJob)
+	if err != nil || result != Duplicate || id != r.ID || existing == nil || existing.ID != j.ID {
+		t.Fatalf("duplicate = %q %v %#v %v", id, result, existing, err)
+	}
+	if counts := s.JobCounts(); counts["pending"] != 1 {
+		t.Fatalf("job counts = %#v", counts)
+	}
+}
+
+func TestGeneratedRequestAndJobIDsCannotOverwriteState(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "store.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	first := validRequest("request-1", "delivery-1", "body-1", now)
+	firstJob := Job{ID: "job-1", RequestID: first.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: now}
+	if _, _, _, err := s.Accept(first, &firstJob); err != nil {
+		t.Fatal(err)
+	}
+	requestCollision := validRequest("request-1", "delivery-2", "body-2", now.Add(time.Second))
+	if _, _, _, err := s.Accept(requestCollision, nil); !errors.Is(err, ErrIDCollision) {
+		t.Fatalf("request collision error = %v", err)
+	}
+	second := validRequest("request-2", "delivery-2", "body-2", now.Add(time.Second))
+	jobCollision := Job{ID: "job-1", RequestID: second.ID, URL: firstJob.URL, State: "pending", CreatedAt: now.Add(time.Second)}
+	if _, _, _, err := s.Accept(second, &jobCollision); !errors.Is(err, ErrIDCollision) {
+		t.Fatalf("job collision error = %v", err)
+	}
+	stored, _, ok := s.Get(first.ID)
+	if !ok || string(stored.Body) != "body-1" {
+		t.Fatalf("original request changed: %#v", stored)
+	}
+}
+
+func TestLeaseOwnershipRetryAndCompletionAreAtomic(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "store.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	r := validRequest("request-1", "delivery-1", "body", now)
+	j := Job{ID: "job-1", RequestID: r.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: now}
+	if _, _, _, err := s.Accept(r, &j); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := s.ClaimNextJob("worker-1", now, time.Minute)
+	if err != nil || !ok || claimed.LeaseOwner != "worker-1" {
+		t.Fatalf("claim = %#v %v %v", claimed, ok, err)
+	}
+	if _, ok, err := s.ClaimNextJob("worker-2", now.Add(time.Second), time.Minute); err != nil || ok {
+		t.Fatalf("competing claim = %v %v", ok, err)
+	}
+	attempt := Attempt{ID: "attempt-1", JobID: j.ID, RequestID: r.ID, Number: 1, StartedAt: now, FinishedAt: now.Add(time.Second)}
+	if err := s.RecordAttempt(j.ID, "worker-2", attempt, "retrying", "", now.Add(time.Minute)); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("non-owner transition = %v", err)
+	}
+	if err := s.RecordAttempt(j.ID, "worker-1", attempt, "retrying", "", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.ClaimNextJob("worker-2", now.Add(30*time.Second), time.Minute); ok {
+		t.Fatal("job claimed before retry availability")
+	}
+	claimed, ok, err = s.ClaimNextJob("worker-2", now.Add(2*time.Minute), time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("retry claim = %#v %v %v", claimed, ok, err)
+	}
+	attempt.ID = "attempt-2"
+	attempt.Number = 2
+	attempt.StartedAt = now.Add(2 * time.Minute)
+	attempt.FinishedAt = attempt.StartedAt.Add(time.Second)
+	if err := s.RecordAttempt(j.ID, "worker-2", attempt, "succeeded", "", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if counts := s.JobCounts(); counts["succeeded"] != 1 || len(s.UnfinishedJobs()) != 0 {
+		t.Fatalf("final state = %#v", counts)
+	}
+}
+
+func TestRetentionEvictionCompactionAndRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.ndjson")
+	s, err := OpenWithOptions(path, Options{MaxCaptures: 2, MaxEvents: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for i := 1; i <= 3; i++ {
+		r := validRequest(fmt.Sprintf("request-%d", i), fmt.Sprintf("delivery-%d", i), fmt.Sprintf("body-%d", i), now.Add(time.Duration(i)*time.Second))
+		if _, result, err := s.Capture(r); err != nil || result != Captured {
+			t.Fatalf("capture %d = %v %v", i, result, err)
+		}
+	}
+	if _, _, ok := s.Get("request-1"); ok {
+		t.Fatal("oldest completed capture was not evicted")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = OpenWithOptions(path, Options{MaxCaptures: 2, MaxEvents: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, _, ok := s.Get("request-1"); ok {
+		t.Fatal("evicted capture returned after recovery")
+	}
+	for _, id := range []string{"request-2", "request-3"} {
+		if _, _, ok := s.Get(id); !ok {
+			t.Fatalf("retained capture %s missing", id)
+		}
+	}
+}
+
+func TestRetentionDoesNotEvictUnfinishedForwarding(t *testing.T) {
+	s, err := OpenWithOptions(filepath.Join(t.TempDir(), "store.ndjson"), Options{MaxCaptures: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	r := validRequest("request-1", "delivery-1", "body", now)
+	j := Job{ID: "job-1", RequestID: r.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: now}
+	if _, _, _, err := s.Accept(r, &j); err != nil {
+		t.Fatal(err)
+	}
+	second := validRequest("request-2", "delivery-2", "body-2", now.Add(time.Second))
+	if _, _, err := s.Capture(second); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("capacity error = %v", err)
+	}
+	if _, _, ok := s.Get(r.ID); !ok {
+		t.Fatal("unfinished capture was evicted")
+	}
+}
+
+func TestSearchIndexAndSSECatchUpAreBounded(t *testing.T) {
+	s, err := OpenWithOptions(filepath.Join(t.TempDir(), "store.ndjson"), Options{MaxSearchBytes: 4, MaxCatchUpEvents: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	for i, body := range []string{"abcdef", "second", "third"} {
+		r := validRequest(fmt.Sprintf("request-%d", i+1), fmt.Sprintf("delivery-%d", i+1), body, now.Add(time.Duration(i)*time.Second))
+		if _, _, err := s.Capture(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if items, total := s.ListSummaries("abcd", 0, 10); total != 1 || len(items) != 1 {
+		t.Fatalf("indexed prefix result = %d %#v", total, items)
+	}
+	if _, total := s.ListSummaries("ef", 0, 10); total != 0 {
+		t.Fatalf("unindexed suffix matched %d records", total)
+	}
+	if _, _, _, err := s.SubscribeFrom(0); !errors.Is(err, ErrEventBacklog) {
+		t.Fatalf("old cursor error = %v", err)
+	}
+	old, _, cancel, err := s.SubscribeFrom(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	if len(old) != 2 || old[0].Seq != 2 || old[1].Seq != 3 {
+		t.Fatalf("bounded ring catch-up = %#v", old)
+	}
+}
+
+func TestAtomicCaptureFailureInjection(t *testing.T) {
+	now := time.Now().UTC()
+	r := validRequest("request-1", "delivery-1", "body", now)
+	j := Job{ID: "job-1", RequestID: r.ID, URL: "https://example.com/hooks", State: "pending", CreatedAt: now}
+
+	writePath := filepath.Join(t.TempDir(), "write.ndjson")
+	s, err := Open(writePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.beforeWrite = func(Event) error { return errors.New("injected write failure") }
+	if _, _, _, err := s.Accept(r, &j); err == nil {
+		t.Fatal("injected write failure was ignored")
+	}
+	if _, _, ok := s.Get(r.ID); ok {
+		t.Fatal("failed write entered the in-memory index")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(writePath); err != nil || info.Size() != 0 {
+		t.Fatalf("failed write size = %v, %v", info, err)
+	}
+
+	syncPath := filepath.Join(t.TempDir(), "sync.ndjson")
+	s, err = Open(syncPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.beforeSync = func(Event) error { return errors.New("injected sync failure") }
+	if _, _, _, err := s.Accept(r, &j); err == nil {
+		t.Fatal("injected sync failure was ignored")
+	}
+	if _, _, ok := s.Get(r.ID); ok {
+		t.Fatal("failed sync entered the in-memory index")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(syncPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, _, ok := s.Get(r.ID); !ok || s.JobCounts()["pending"] != 1 {
+		t.Fatalf("ambiguous sync recovery lost atomic record: request=%v jobs=%#v", ok, s.JobCounts())
+	}
+}
+
+func TestCanceledSearchAndSlowSubscriberAreBounded(t *testing.T) {
+	s, err := OpenWithOptions(filepath.Join(t.TempDir(), "store.ndjson"), Options{SubscriberBacklog: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	ctx, cancelSearch := context.WithCancel(context.Background())
+	cancelSearch()
+	if _, _, _, err := s.ListSummariesContext(ctx, "anything", 0, 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled search error = %v", err)
+	}
+
+	_, ch, cancelSubscription, err := s.SubscribeFrom(s.Sequence())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancelSubscription()
+	for i := 1; i <= 2; i++ {
+		r := validRequest(fmt.Sprintf("request-%d", i), fmt.Sprintf("delivery-%d", i), "body", now.Add(time.Duration(i)*time.Second))
+		if _, _, err := s.Capture(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := <-ch; !ok {
+		t.Fatal("buffered event missing")
+	}
+	if _, ok := <-ch; ok {
+		t.Fatal("slow subscriber was not disconnected")
+	}
+}
+
+func TestConcurrentWorstCaseSearchDoesNotBlockCapture(t *testing.T) {
+	s, err := OpenWithOptions(filepath.Join(t.TempDir(), "store.ndjson"), Options{MaxCaptures: 600, MaxSearchBytes: 64 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	body := strings.Repeat("a", 64<<10)
+	for i := 0; i < 500; i++ {
+		r := validRequest(fmt.Sprintf("request-%d", i), fmt.Sprintf("delivery-%d", i), body, now.Add(time.Duration(i)*time.Nanosecond))
+		if _, _, err := s.Capture(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 10; j++ {
+				if _, _, _, err := s.ListSummariesContext(context.Background(), "not-present", 0, 200); err != nil {
+					t.Error(err)
+				}
+			}
+		}()
+	}
+	close(start)
+	begin := time.Now()
+	r := validRequest("request-new", "delivery-new", "new", now.Add(time.Hour))
+	if _, _, err := s.Capture(r); err != nil {
+		t.Fatal(err)
+	}
+	latency := time.Since(begin)
+	wg.Wait()
+	if latency > 500*time.Millisecond {
+		t.Fatalf("capture blocked by search for %v", latency)
+	}
 }

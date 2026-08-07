@@ -33,28 +33,31 @@ import (
 type Config struct {
 	Store                             *store.Store
 	Secret, ForwardURL, OperatorToken string
+	ForwardAuthorization              string
+	SensitiveHeaders                  []string
 	MaxBody                           int64
 	Attempts, Concurrency, QueueSize  int
 	MaxInFlight                       int
 	BaseBackoff, MaxBackoff           time.Duration
+	LeaseDuration, PollInterval       time.Duration
+	SearchTimeout                     time.Duration
 	Client                            *http.Client
 	Logger                            *slog.Logger
+	IDSource                          func() (string, error)
 	AllowPrivateTargets               bool
 	SecureCookies                     bool
 }
 
-type work struct{ job store.Job }
-
 type App struct {
 	c         Config
 	mux       *http.ServeMux
-	queue     chan work
+	wake      chan struct{}
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
-	workWG    sync.WaitGroup
 	accepting atomic.Bool
 	ingestSem chan struct{}
+	sensitive map[string]struct{}
 }
 
 func New(c Config) *App {
@@ -79,6 +82,15 @@ func New(c Config) *App {
 	if c.MaxBackoff <= 0 {
 		c.MaxBackoff = 30 * time.Second
 	}
+	if c.LeaseDuration <= 0 {
+		c.LeaseDuration = 2 * time.Minute
+	}
+	if c.PollInterval <= 0 {
+		c.PollInterval = 250 * time.Millisecond
+	}
+	if c.SearchTimeout <= 0 {
+		c.SearchTimeout = 2 * time.Second
+	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
@@ -87,35 +99,29 @@ func New(c Config) *App {
 	} else if c.Client.CheckRedirect == nil {
 		c.Client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	}
+	if c.IDSource == nil {
+		c.IDSource = newID
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &App{
 		c:         c,
 		mux:       http.NewServeMux(),
-		queue:     make(chan work, c.QueueSize),
+		wake:      make(chan struct{}, max(1, c.QueueSize)),
 		ctx:       ctx,
 		cancel:    cancel,
 		ingestSem: make(chan struct{}, c.MaxInFlight),
+		sensitive: sensitiveHeaderPolicy(c.SensitiveHeaders),
 	}
 	a.accepting.Store(true)
 	a.routes()
+	if err := c.Store.RecoverLeases(time.Now().UTC()); err != nil {
+		c.Logger.Error("recover forwarding leases", "error", err)
+	}
 	for i := 0; i < c.Concurrency; i++ {
 		a.wg.Add(1)
-		go a.worker()
+		go a.worker(fmt.Sprintf("worker-%d-%p", i, a))
 	}
-	for _, j := range c.Store.UnfinishedJobs() {
-		a.workWG.Add(1)
-		select {
-		case a.queue <- work{j}:
-		default:
-			go func(j store.Job) {
-				select {
-				case a.queue <- work{j}:
-				case <-a.ctx.Done():
-					a.workWG.Done()
-				}
-			}(j)
-		}
-	}
+	a.signalWork()
 	return a
 }
 
@@ -194,17 +200,18 @@ func (a *App) routes() {
 	a.mux.Handle("GET /api/requests/{id}", a.operator(http.HandlerFunc(a.get)))
 	a.mux.Handle("POST /api/requests/{id}/replay", a.operator(http.HandlerFunc(a.replay)))
 	a.mux.Handle("GET /api/events", a.operator(http.HandlerFunc(a.events)))
+	a.mux.Handle("GET /api/metrics", a.operator(http.HandlerFunc(a.metrics)))
 	a.mux.Handle("POST /api/session", a.operator(http.HandlerFunc(a.session)))
 	a.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		if a.c.Store.Health() != nil {
-			http.Error(w, "unhealthy", 503)
+			http.Error(w, "unhealthy", http.StatusServiceUnavailable)
 			return
 		}
 		w.Write([]byte("ok\n"))
 	})
 	a.mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		if !a.accepting.Load() || a.c.Store.Health() != nil {
-			http.Error(w, "not ready", 503)
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
 			return
 		}
 		w.Write([]byte("ready\n"))
@@ -244,17 +251,17 @@ func (a *App) operator(next http.Handler) http.Handler {
 		}
 		if a.c.OperatorToken == "" || len(got) != len(expected) || subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="relaybox"`)
-			http.Error(w, "operator token required", 401)
+			http.Error(w, "operator token required", http.StatusUnauthorized)
 			return
 		}
 		if r.Method != "GET" && r.Method != "HEAD" {
 			origin := r.Header.Get("Origin")
 			if usedCookie && origin == "" {
-				http.Error(w, "origin required for cookie-authenticated request", 403)
+				http.Error(w, "origin required for cookie-authenticated request", http.StatusForbidden)
 				return
 			}
 			if origin != "" && !a.sameOrigin(r, origin) {
-				http.Error(w, "cross-origin request denied", 403)
+				http.Error(w, "cross-origin request denied", http.StatusForbidden)
 				return
 			}
 		}
@@ -301,7 +308,7 @@ func jsonOut(w http.ResponseWriter, status int, v any) {
 
 func (a *App) ingest(w http.ResponseWriter, r *http.Request) {
 	if !a.accepting.Load() {
-		http.Error(w, "shutting down", 503)
+		http.Error(w, "shutting down", http.StatusServiceUnavailable)
 		return
 	}
 	select {
@@ -327,17 +334,34 @@ func (a *App) ingest(w http.ResponseWriter, r *http.Request) {
 	hash := hex.EncodeToString(sum[:])
 	signatureVerified := a.c.Secret != "" && verify(a.c.Secret, r.Header.Get("X-Hub-Signature-256"), body)
 	if a.c.Secret != "" && !signatureVerified {
-		http.Error(w, "invalid signature", 401)
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
-	id, err := newID()
+	id, err := a.c.IDSource()
 	if err != nil {
 		http.Error(w, "entropy unavailable", 500)
 		return
 	}
-	req := store.Request{ID: id, DeliveryID: r.Header.Get("X-GitHub-Delivery"), Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr, BodySHA256: hash, ReceivedAt: time.Now().UTC(), Headers: redact(r.Header), Body: body, SignatureVerified: signatureVerified}
-	id, result, err := a.c.Store.Capture(req)
+	req := store.Request{ID: id, DeliveryID: r.Header.Get("X-GitHub-Delivery"), Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr, BodySHA256: hash, ReceivedAt: time.Now().UTC(), Headers: a.redact(r.Header), Body: body, SignatureVerified: signatureVerified}
+	var job *store.Job
+	if a.c.ForwardURL != "" {
+		if err := validateTarget(a.c.ForwardURL, a.c.AllowPrivateTargets); err != nil {
+			http.Error(w, "invalid forwarding target", 500)
+			return
+		}
+		jobID, idErr := a.c.IDSource()
+		if idErr != nil {
+			http.Error(w, "entropy unavailable", 500)
+			return
+		}
+		job = &store.Job{ID: jobID, RequestID: req.ID, URL: a.c.ForwardURL, State: "pending", CreatedAt: time.Now().UTC()}
+	}
+	id, result, persistedJob, err := a.c.Store.Accept(req, job)
 	if err != nil {
+		if errors.Is(err, store.ErrCapacity) {
+			http.Error(w, "retention capacity reached", http.StatusInsufficientStorage)
+			return
+		}
 		http.Error(w, "storage failure", 500)
 		return
 	}
@@ -346,14 +370,14 @@ func (a *App) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if result == store.Duplicate {
+		if persistedJob != nil && !terminalJobState(persistedJob.State) {
+			a.signalWork()
+		}
 		jsonOut(w, 200, map[string]any{"id": id, "duplicate": true})
 		return
 	}
-	if a.c.ForwardURL != "" {
-		if err = a.schedule(r.Context(), req, a.c.ForwardURL); err != nil {
-			http.Error(w, "forward scheduling failed", 500)
-			return
-		}
+	if persistedJob != nil {
+		a.signalWork()
 	}
 	jsonOut(w, 202, map[string]any{"id": id, "duplicate": false})
 }
@@ -369,17 +393,39 @@ func verify(secret, sig string, body []byte) bool {
 	m.Write(body)
 	return hmac.Equal(got, m.Sum(nil))
 }
-func redact(h http.Header) store.Header {
+func sensitiveHeaderPolicy(extra []string) map[string]struct{} {
+	policy := map[string]struct{}{}
+	for _, name := range []string{
+		"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie",
+		"API-Key", "X-API-Key", "API-Token", "X-API-Token", "X-Auth-Token",
+		"X-Access-Token", "X-Client-Token", "X-Token", "Secret-Key", "X-Secret-Key",
+		"X-Secret", "X-Client-Secret", "X-Amz-Security-Token",
+		"X-Hub-Signature", "X-Hub-Signature-256",
+	} {
+		policy[strings.ToLower(name)] = struct{}{}
+	}
+	for _, name := range extra {
+		if name = strings.TrimSpace(name); name != "" {
+			policy[strings.ToLower(name)] = struct{}{}
+		}
+	}
+	return policy
+}
+
+func redactWithPolicy(h http.Header, policy map[string]struct{}) store.Header {
 	out := store.Header{}
 	for k, v := range h {
-		lk := strings.ToLower(k)
-		if lk == "authorization" || lk == "proxy-authorization" || lk == "cookie" || lk == "set-cookie" || lk == "x-hub-signature" || lk == "x-hub-signature-256" || strings.Contains(lk, "token") || strings.Contains(lk, "secret") {
+		if _, sensitive := policy[strings.ToLower(k)]; sensitive {
 			out[k] = []string{"[REDACTED]"}
 		} else {
 			out[k] = append([]string(nil), v...)
 		}
 	}
 	return out
+}
+
+func (a *App) redact(h http.Header) store.Header {
+	return redactWithPolicy(h, a.sensitive)
 }
 func newID() (string, error) {
 	b := make([]byte, 16)
@@ -395,8 +441,14 @@ func (a *App) list(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := parseBounded(r.URL.Query().Get("limit"), 50, 1, 200)
 	offset := parseBounded(r.URL.Query().Get("offset"), 0, 0, 1_000_000)
-	items, total := a.c.Store.ListSummaries(r.URL.Query().Get("q"), offset, limit)
-	jsonOut(w, 200, map[string]any{"items": items, "total": total, "offset": offset, "limit": limit})
+	ctx, cancel := context.WithTimeout(r.Context(), a.c.SearchTimeout)
+	defer cancel()
+	items, total, truncated, err := a.c.Store.ListSummariesContext(ctx, r.URL.Query().Get("q"), offset, limit)
+	if err != nil {
+		http.Error(w, "search budget exceeded", http.StatusServiceUnavailable)
+		return
+	}
+	jsonOut(w, 200, map[string]any{"items": items, "total": total, "offset": offset, "limit": limit, "truncated": truncated})
 }
 func parseBounded(s string, def, min, max int) int {
 	n, e := strconv.Atoi(s)
@@ -429,7 +481,11 @@ func (a *App) replay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "configured forward URL required", 400)
 		return
 	}
-	if err := a.schedule(r.Context(), req, a.c.ForwardURL); err != nil {
+	if err := a.schedule(req, a.c.ForwardURL); err != nil {
+		if errors.Is(err, store.ErrCapacity) {
+			http.Error(w, "replay retention capacity reached", http.StatusInsufficientStorage)
+			return
+		}
 		http.Error(w, "scheduling failed", 500)
 		return
 	}
@@ -448,113 +504,141 @@ func validateTarget(raw string, allowPrivate bool) error {
 	}
 	return nil
 }
-func (a *App) schedule(ctx context.Context, req store.Request, target string) error {
+func (a *App) schedule(req store.Request, target string) error {
 	if err := validateTarget(target, a.c.AllowPrivateTargets); err != nil {
 		return err
 	}
-	id, e := newID()
+	id, e := a.c.IDSource()
 	if e != nil {
 		return e
 	}
-	j := store.Job{ID: id, RequestID: req.ID, URL: target, State: "queued", CreatedAt: time.Now().UTC()}
-	if _, e = a.c.Store.Append(store.Event{Kind: "forward.queued", Job: &j}); e != nil {
+	j := store.Job{ID: id, RequestID: req.ID, URL: target, State: "pending", CreatedAt: time.Now().UTC()}
+	if e = a.c.Store.Enqueue(j); e != nil {
 		return e
 	}
-	a.workWG.Add(1)
+	a.signalWork()
+	return nil
+}
+
+func (a *App) signalWork() {
 	select {
-	case a.queue <- work{j}:
-		return nil
-	case <-ctx.Done():
-		a.workWG.Done()
-		return ctx.Err()
-	case <-a.ctx.Done():
-		a.workWG.Done()
-		return errors.New("shutting down")
+	case a.wake <- struct{}{}:
+	default:
 	}
 }
-func (a *App) worker() {
+
+func terminalJobState(state string) bool {
+	switch state {
+	case "succeeded", "failed", "fatal", "dead-letter", "poison":
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *App) worker(owner string) {
 	defer a.wg.Done()
+	ticker := time.NewTicker(a.c.PollInterval)
+	defer ticker.Stop()
 	for {
 		select {
-		case x := <-a.queue:
-			a.forward(x.job)
-			a.workWG.Done()
+		case <-a.wake:
+		case <-ticker.C:
 		case <-a.ctx.Done():
 			return
 		}
-	}
-}
-func (a *App) forward(j store.Job) {
-	req, _, ok := a.c.Store.Get(j.RequestID)
-	if !ok {
-		a.finishJob(j, "poison", "request missing")
-		return
-	}
-	startN := a.c.Store.AttemptsForJob(j.ID) + 1
-	j.State = "running"
-	_, _ = a.c.Store.Append(store.Event{Kind: "forward.running", Job: &j})
-	for n := startN; n <= a.c.Attempts; n++ {
-		started := time.Now().UTC()
-		hr, e := http.NewRequestWithContext(a.ctx, http.MethodPost, j.URL, bytes.NewReader(req.Body))
-		if e == nil {
-			hr.Header = forwardHeaders(req.Headers)
-			hr.Header.Set("X-Relaybox-Request-ID", req.ID)
-			hr.Header.Set("X-Relaybox-Job-ID", j.ID)
-		}
-		var status int
-		var rh store.Header
-		var rb []byte
-		var retry time.Duration
-		var retryValid bool
-		if e == nil {
-			resp, doErr := a.c.Client.Do(hr)
-			e = doErr
-			if resp != nil {
-				status = resp.StatusCode
-				rh = redact(resp.Header)
-				rb, _ = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-				resp.Body.Close()
-				retry, retryValid = parseRetry(resp.Header.Get("Retry-After"), time.Now())
+		for {
+			j, ok, err := a.c.Store.ClaimNextJob(owner, time.Now().UTC(), a.c.LeaseDuration)
+			if err != nil {
+				a.c.Logger.Error("claim forwarding job", "error", err)
+				break
 			}
-		}
-		attID, idErr := newID()
-		if idErr != nil {
-			a.finishJob(j, "poison", idErr.Error())
-			return
-		}
-		att := store.Attempt{ID: attID, JobID: j.ID, RequestID: req.ID, URL: j.URL, Number: n, Status: status, StartedAt: started, FinishedAt: time.Now().UTC(), ResponseHeaders: rh, ResponseBody: rb}
-		if e != nil {
-			att.Error = e.Error()
-		}
-		if _, appendErr := a.c.Store.Append(store.Event{Kind: "attempt.finished", Attempt: &att}); appendErr != nil {
-			a.c.Logger.Error("persist attempt", "error", appendErr, "job", j.ID)
-			return
-		}
-		if e == nil && status >= 200 && status < 300 {
-			a.finishJob(j, "succeeded", "")
-			return
-		}
-		if e == nil && !retryStatus(status) {
-			a.finishJob(j, "fatal", fmt.Sprintf("non-retryable status %d", status))
-			return
-		}
-		if n < a.c.Attempts {
-			if !retryValid {
-				retry = a.backoff(j.ID, n)
+			if !ok {
+				break
 			}
-			if retry > a.c.MaxBackoff {
-				retry = a.c.MaxBackoff
-			}
-			timer := time.NewTimer(retry)
-			select {
-			case <-timer.C:
-			case <-a.ctx.Done():
-				timer.Stop()
+			a.signalWork()
+			a.forward(owner, j)
+			if a.ctx.Err() != nil {
 				return
 			}
 		}
 	}
-	a.finishJob(j, "failed", "attempts exhausted")
+}
+func (a *App) forward(owner string, j store.Job) {
+	req, _, ok := a.c.Store.Get(j.RequestID)
+	if !ok {
+		if err := a.c.Store.FinishWithoutAttempt(j.ID, owner, "poison", "request missing"); err != nil {
+			a.c.Logger.Error("persist poison job", "error", err, "job", j.ID)
+		}
+		return
+	}
+	n := a.c.Store.AttemptsForJob(j.ID) + 1
+	attID, idErr := a.c.IDSource()
+	if idErr != nil {
+		if err := a.c.Store.FinishWithoutAttempt(j.ID, owner, "poison", "attempt ID unavailable"); err != nil {
+			a.c.Logger.Error("persist poison job", "error", err, "job", j.ID)
+		}
+		return
+	}
+	started := time.Now().UTC()
+	hr, requestErr := http.NewRequestWithContext(a.ctx, http.MethodPost, j.URL, bytes.NewReader(req.Body))
+	if requestErr == nil {
+		hr.Header = forwardHeaders(req.Headers)
+		if a.c.ForwardAuthorization != "" {
+			hr.Header.Set("Authorization", a.c.ForwardAuthorization)
+		}
+		hr.Header.Set("X-Relaybox-Request-ID", req.ID)
+		hr.Header.Set("X-Relaybox-Job-ID", j.ID)
+	}
+	var status int
+	var responseHeaders store.Header
+	var responseBody []byte
+	var retry time.Duration
+	var retryValid bool
+	if requestErr == nil {
+		resp, doErr := a.c.Client.Do(hr)
+		requestErr = doErr
+		if resp != nil {
+			status = resp.StatusCode
+			responseHeaders = a.redact(resp.Header)
+			responseBody, _ = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			resp.Body.Close()
+			retry, retryValid = parseRetry(resp.Header.Get("Retry-After"), time.Now())
+		}
+	}
+	finished := time.Now().UTC()
+	att := store.Attempt{ID: attID, JobID: j.ID, RequestID: req.ID, URL: j.URL, Number: n, Status: status, StartedAt: started, FinishedAt: finished, ResponseHeaders: responseHeaders, ResponseBody: responseBody}
+	if requestErr != nil {
+		att.Error = requestErr.Error()
+	}
+	state := "succeeded"
+	message := ""
+	availableAt := time.Time{}
+	switch {
+	case requestErr == nil && status >= 200 && status < 300:
+	case requestErr == nil && !retryStatus(status):
+		state = "fatal"
+		message = fmt.Sprintf("non-retryable status %d", status)
+	case n >= a.c.Attempts:
+		state = "dead-letter"
+		message = "attempts exhausted"
+	default:
+		state = "retrying"
+		if !retryValid {
+			retry = a.backoff(j.ID, n)
+		}
+		if retry > a.c.MaxBackoff {
+			retry = a.c.MaxBackoff
+		}
+		availableAt = finished.Add(retry)
+	}
+	if err := a.c.Store.RecordAttempt(j.ID, owner, att, state, message, availableAt); err != nil {
+		a.c.Logger.Error("persist forwarding attempt", "error", err, "job", j.ID)
+		return
+	}
+	if state == "retrying" {
+		a.signalWork()
+	}
 }
 
 func forwardHeaders(src store.Header) http.Header {
@@ -607,14 +691,6 @@ func (a *App) backoff(job string, n int) time.Duration {
 	fraction := float64(uint16(sum[0])<<8|uint16(sum[1])) / 65535
 	return time.Duration(base * (0.75 + 0.5*fraction))
 }
-func (a *App) finishJob(j store.Job, state, msg string) {
-	j.State = state
-	j.Error = msg
-	j.FinishedAt = time.Now().UTC()
-	if _, e := a.c.Store.Append(store.Event{Kind: "forward." + state, Job: &j}); e != nil {
-		a.c.Logger.Error("persist job state", "error", e, "job", j.ID)
-	}
-}
 func parseRetry(v string, now time.Time) (time.Duration, bool) {
 	if v == "" {
 		return 0, false
@@ -630,6 +706,10 @@ func parseRetry(v string, now time.Time) (time.Duration, bool) {
 		return max(t.Sub(now), 0), true
 	}
 	return 0, false
+}
+
+func (a *App) metrics(w http.ResponseWriter, _ *http.Request) {
+	jsonOut(w, http.StatusOK, map[string]any{"forward_jobs": a.c.Store.JobCounts()})
 }
 
 func (a *App) events(w http.ResponseWriter, r *http.Request) {
@@ -722,11 +802,24 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
-func (a *App) Wait() { a.workWG.Wait() }
+func (a *App) Wait() {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if len(a.c.Store.UnfinishedJobs()) == 0 {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-a.ctx.Done():
+			return
+		}
+	}
+}
 func (a *App) Shutdown(ctx context.Context) error {
 	a.accepting.Store(false)
 	done := make(chan struct{})
-	go func() { a.workWG.Wait(); close(done) }()
+	go func() { a.Wait(); close(done) }()
 	select {
 	case <-done:
 		a.cancel()

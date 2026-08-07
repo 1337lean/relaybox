@@ -27,17 +27,20 @@ type Attempt struct {
 }
 
 type Job struct {
-	ID, RequestID, URL, State, Error string
-	CreatedAt, FinishedAt            time.Time
+	ID, RequestID, URL, State, Error, LeaseOwner string
+	CreatedAt, UpdatedAt, AvailableAt            time.Time
+	LeaseExpiresAt, FinishedAt                   time.Time
 }
 
 type Event struct {
-	Seq     uint64    `json:"seq"`
-	Kind    string    `json:"kind"`
-	At      time.Time `json:"at"`
-	Request *Request  `json:"request,omitempty"`
-	Attempt *Attempt  `json:"attempt,omitempty"`
-	Job     *Job      `json:"job,omitempty"`
+	Seq               uint64    `json:"seq"`
+	Kind              string    `json:"kind"`
+	At                time.Time `json:"at"`
+	Request           *Request  `json:"request,omitempty"`
+	Attempt           *Attempt  `json:"attempt,omitempty"`
+	Job               *Job      `json:"job,omitempty"`
+	EvictedRequestIDs []string  `json:"evicted_request_ids,omitempty"`
+	EvictedJobIDs     []string  `json:"evicted_job_ids,omitempty"`
 }
 
 type CaptureResult int

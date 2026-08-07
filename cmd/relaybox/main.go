@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -55,8 +56,12 @@ func serve(args []string) {
 	max := fs.Int64("max-body", 1<<20, "maximum request body bytes")
 	attempts := fs.Int("attempts", 3, "forward attempts")
 	conc := fs.Int("concurrency", 4, "forward worker count")
-	queue := fs.Int("queue-size", 64, "bounded forward queue size")
+	queue := fs.Int("queue-size", 64, "bounded forwarding wake-up hint buffer size")
 	maxInFlight := fs.Int("max-inflight", 64, "maximum concurrent inbox body reads")
+	retentionCaptures := fs.Int("retention-captures", 1000, "maximum retained captures")
+	retentionEvents := fs.Int("retention-events", 100000, "event count that triggers log compaction")
+	jobsPerRequest := fs.Int("jobs-per-request", 8, "maximum retained forwarding jobs per capture")
+	searchBytes := fs.Int("search-bytes", 64<<10, "maximum indexed body bytes per capture")
 	allowPrivate := fs.Bool("allow-private-targets", false, "allow private/link-local/loopback forwarding (development only)")
 	secureCookies := fs.Bool("secure-cookie", false, "always mark the operator cookie Secure (use behind TLS termination)")
 	fs.Parse(args)
@@ -74,6 +79,18 @@ func serve(args []string) {
 	}
 	if *maxInFlight < 1 || *maxInFlight > 10_000 {
 		log.Fatal("-max-inflight must be between 1 and 10000")
+	}
+	if *retentionCaptures < 1 || *retentionCaptures > 1_000_000 {
+		log.Fatal("-retention-captures must be between 1 and 1000000")
+	}
+	if *retentionEvents < 100 || *retentionEvents > 10_000_000 {
+		log.Fatal("-retention-events must be between 100 and 10000000")
+	}
+	if *jobsPerRequest < 1 || *jobsPerRequest > 1000 {
+		log.Fatal("-jobs-per-request must be between 1 and 1000")
+	}
+	if *searchBytes < 1 || *searchBytes > 1<<20 {
+		log.Fatal("-search-bytes must be between 1 byte and 1 MiB")
 	}
 	if *forward != "" {
 		if err := app.ValidateForwardTarget(*forward, *allowPrivate); err != nil {
@@ -94,23 +111,32 @@ func serve(args []string) {
 	if *secret == "" {
 		log.Print("warning: inbox signature verification is disabled; set RELAYBOX_SECRET for untrusted networks")
 	}
-	st, err := store.Open(*data)
+	st, err := store.OpenWithOptions(*data, store.Options{
+		MaxCaptures:       *retentionCaptures,
+		MaxEvents:         *retentionEvents,
+		MaxJobsPerRequest: *jobsPerRequest,
+		MaxAttemptsPerJob: *attempts,
+		MaxSearchBytes:    *searchBytes,
+		MaxSearchScan:     *retentionCaptures,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer st.Close()
 	a := app.New(app.Config{
-		Store:               st,
-		Secret:              *secret,
-		ForwardURL:          *forward,
-		OperatorToken:       *token,
-		MaxBody:             *max,
-		Attempts:            *attempts,
-		Concurrency:         *conc,
-		QueueSize:           *queue,
-		MaxInFlight:         *maxInFlight,
-		AllowPrivateTargets: *allowPrivate,
-		SecureCookies:       *secureCookies,
+		Store:                st,
+		Secret:               *secret,
+		ForwardURL:           *forward,
+		OperatorToken:        *token,
+		ForwardAuthorization: os.Getenv("RELAYBOX_FORWARD_AUTHORIZATION"),
+		SensitiveHeaders:     splitCommaList(os.Getenv("RELAYBOX_SENSITIVE_HEADERS")),
+		MaxBody:              *max,
+		Attempts:             *attempts,
+		Concurrency:          *conc,
+		QueueSize:            *queue,
+		MaxInFlight:          *maxInFlight,
+		AllowPrivateTargets:  *allowPrivate,
+		SecureCookies:        *secureCookies,
 	})
 	srv := &http.Server{
 		Addr:              *addr,
@@ -142,6 +168,16 @@ func serve(args []string) {
 	if err := app.ShutdownServer(shutdown, srv, a); err != nil {
 		log.Print(err)
 	}
+}
+
+func splitCommaList(value string) []string {
+	var out []string
+	for name := range strings.SplitSeq(value, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func healthcheck(args []string) {

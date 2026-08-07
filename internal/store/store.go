@@ -106,7 +106,7 @@ func OpenWithOptions(path string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	f, err := openStoreFile(path, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1006,7 +1006,7 @@ func (s *Store) compactLocked() error {
 	if err := syncDirectory(dir); err != nil {
 		return err
 	}
-	newFile, err := os.OpenFile(s.path, os.O_RDWR, 0600)
+	newFile, err := openStoreFile(s.path, false)
 	if err != nil {
 		return err
 	}
